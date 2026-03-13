@@ -1,1 +1,1 @@
-time to get started ig
+time to get starte
