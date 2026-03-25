@@ -23,8 +23,8 @@ CHARACTERS = {
 }
 
 SECRET_PASSAGES = {
-    (0, 0): (23, 24), (23, 24): (0, 0),
-    (23, 0): (0, 24), (0, 24): (23, 0),
+    (2, 4): (25, 28), (25, 28): (2, 4),
+    (31, 7): (3, 24), (3, 24): (31, 7),
 }
 
 COLOR_TO_ROOM = {
@@ -36,6 +36,10 @@ COLOR_TO_ROOM = {
     (128, 128, 128): "CENTER", (255, 20, 147): "DOOR",
     (150, 0, 0): "START"
 }
+
+# Temporary fix for mask tiles that should be doors but are not colored as DOOR.
+# Study entrance at (9, 5) is currently painted as wall in board_mask.png.
+FORCED_DOOR_CELLS = {(9, 5)}
 
 class CluedoGame:
     def __init__(self):
@@ -56,6 +60,7 @@ class CluedoGame:
         self.grid_height = self.board_height // CELL_SIZE
         
         self.grid = self._create_grid()
+        self.door_to_rooms = self._build_door_room_map()
         self.characters = CHARACTERS
         self.show_rooms = False
         self.show_grid = True  # Added state for grid toggle
@@ -71,6 +76,9 @@ class CluedoGame:
                 color = self.mask_image.get_at((pixel_x, pixel_y))[:3]
                 room_type = COLOR_TO_ROOM.get(color, "WALL")
 
+                if (gx, gy) in FORCED_DOOR_CELLS:
+                    room_type = "DOOR"
+
                 row.append({
                     "type": room_type,
                     "walkable": room_type in ["HALLWAY", "DOOR", "START"],
@@ -79,27 +87,70 @@ class CluedoGame:
             grid.append(row)
         return grid
 
+    def _build_door_room_map(self):
+        """Map each door cell to the room(s) it actually connects to by adjacency."""
+        door_map = {}
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+        for gy in range(self.grid_height):
+            for gx in range(self.grid_width):
+                if self.grid[gy][gx]["type"] != "DOOR":
+                    continue
+
+                connected_rooms = set()
+                for dx, dy in directions:
+                    nx, ny = gx + dx, gy + dy
+                    if 0 <= nx < self.grid_width and 0 <= ny < self.grid_height:
+                        neighbor = self.grid[ny][nx]
+                        if neighbor["is_room"]:
+                            connected_rooms.add(neighbor["type"])
+
+                door_map[(gx, gy)] = connected_rooms
+
+        return door_map
+
     def handle_move(self, target_gx, target_gy):
         if not (0 <= target_gx < self.grid_width and 0 <= target_gy < self.grid_height):
             return
 
         char = self.characters[self.current_turn]
         current_gx, current_gy = char["position"]
+        current_cell = self.grid[current_gy][current_gx]
         target_cell = self.grid[target_gy][target_gx]
 
-        # Secret Passage Logic
+        # --- CORRECTED SECRET PASSAGE LOGIC ---
+        # 1. Check if the player is currently standing on a secret passage tile
         if (current_gx, current_gy) in SECRET_PASSAGES:
-            char["position"] = SECRET_PASSAGES[(current_gx, current_gy)]
+            dest_gx, dest_gy = SECRET_PASSAGES[(current_gx, current_gy)]
+            
+            # 2. ONLY teleport if they click the EXACT destination tile
+            # (Or click anywhere inside the destination room)
+            if (target_gx, target_gy) == (dest_gx, dest_gy):
+                char["position"] = (dest_gx, dest_gy)
+                print(f"{self.current_turn} used the Secret Passage to {target_cell['type']}!")
+                # In Cluedo, using a passage ends your movement turn
+                self.next_turn() 
+                return 
+
+        # --- STANDARD MOVEMENT LOGIC ---
+        # If we didn't teleport, check if the click was a valid walk move
+        if target_cell["type"] == "WALL": 
             return
-
-        # Basic Move Validation
-        if target_cell["type"] == "WALL": return
         
+        # Room Entry Logic (Must be on a DOOR to enter)
         if target_cell["is_room"]:
-            if self.grid[current_gy][current_gx]["type"] != "DOOR":
-                return # Can't enter room unless on a door
+            if current_cell["type"] != "DOOR":
+                print("You must use a door to enter a room!")
+                return
 
+            connected_rooms = self.door_to_rooms.get((current_gx, current_gy), set())
+            if target_cell["type"] not in connected_rooms:
+                print(f"This door does not lead to {target_cell['type']}!")
+                return
+
+        # Update position
         char["position"] = (target_gx, target_gy)
+        print(f"Moved {self.current_turn} to {target_cell['type']}")
 
     def draw(self):
         self.screen.fill((0, 0, 0))

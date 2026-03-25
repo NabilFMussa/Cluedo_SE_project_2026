@@ -53,12 +53,11 @@ while running:
     
     # Draw mask with transparency so you can see the board underneath
     overlay = mask_surface.copy()
-    overlay.set_alpha(160) 
+    overlay.set_alpha(0) 
     screen.blit(overlay, (0, 0))
     
     # UI Overlay
     status_text = font.render(f"Tool: {current_room_name} | Color: {current_color}", True, (255, 255, 255))
-    pygame.draw.rect(screen, (0,0,0), (5, 5, 400, 30))
     screen.blit(status_text, (10, 10))
 
     for event in pygame.event.get():
