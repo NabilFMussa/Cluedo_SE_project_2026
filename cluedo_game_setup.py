@@ -1,5 +1,7 @@
 import pygame
 import sys
+import random
+from collections import deque
 
 # Initialize Pygame
 pygame.init()
@@ -9,10 +11,19 @@ BOARD_IMG = "Assets_images/game board.png"
 MASK_IMG = "Assets_images/board_mask.png"
 
 CELL_SIZE = 20
-UI_BAR_HEIGHT = 30  # Height of the black bar at the top
-GRID_COLOR = (100, 100, 100)
+UI_BAR_HEIGHT = 30 
+GRID_COLOR = (60, 60, 60) # Slightly darker for better visibility
 
-# --- HARDCODED STARTING POSITIONS (gx, gy) ---
+# --- CHARACTER ORDER & DATA ---
+CHARACTER_ORDER = [
+    "Miss Scarlett", 
+    "Col. Mustard", 
+    "Mrs. White", 
+    "Rev. Green", 
+    "Mrs. Peacock", 
+    "Prof. Plum"
+]
+
 CHARACTERS = {
     "Miss Scarlett": {"color": (255, 0, 0),    "position": (22, 1)},
     "Col. Mustard":  {"color": (255, 215, 0),  "position": (31, 9)},
@@ -22,9 +33,13 @@ CHARACTERS = {
     "Prof. Plum":    {"color": (128, 0, 128),  "position": (2, 7)},
 }
 
+# --- SECRET PASSAGES ---
+# Room-to-room mapping so passage works anywhere inside the source room.
 SECRET_PASSAGES = {
-    (2, 4): (25, 28), (25, 28): (2, 4),
-    (31, 7): (3, 24), (3, 24): (31, 7),
+    "STUDY": "KITCHEN",
+    "KITCHEN": "STUDY",
+    "LOUNGE": "CONSERVATORY",
+    "CONSERVATORY": "LOUNGE",
 }
 
 COLOR_TO_ROOM = {
@@ -37,10 +52,6 @@ COLOR_TO_ROOM = {
     (150, 0, 0): "START"
 }
 
-# Temporary fix for mask tiles that should be doors but are not colored as DOOR.
-# Study entrance at (9, 5) is currently painted as wall in board_mask.png.
-FORCED_DOOR_CELLS = {(9, 5)}
-
 class CluedoGame:
     def __init__(self):
         try:
@@ -51,8 +62,7 @@ class CluedoGame:
             sys.exit()
         
         self.board_width, self.board_height = self.board_image.get_size()
-        
-        # Increase window height by UI_BAR_HEIGHT so the bar doesn't cover the board
+        # Create screen with extra height for UI
         self.screen = pygame.display.set_mode((self.board_width, self.board_height + UI_BAR_HEIGHT))
         pygame.display.set_caption("Cluedo Game Engine")
 
@@ -61,10 +71,21 @@ class CluedoGame:
         
         self.grid = self._create_grid()
         self.door_to_rooms = self._build_door_room_map()
+        self.room_anchor_by_type = self._build_room_anchor_map()
         self.characters = CHARACTERS
         self.show_rooms = False
-        self.show_grid = True  # Added state for grid toggle
-        self.current_turn = "Miss Scarlett"
+        self.show_grid = True
+
+        # Turn management
+        self.current_turn_index = 0
+        self.current_turn = CHARACTER_ORDER[self.current_turn_index]
+
+        # Movement state
+        self.phase = "ROLL"       # "ROLL" = waiting to roll | "MOVE" = pick a destination
+        self.dice_result = (0, 0)
+        self.steps = 0
+        self.reachable = set()        # (gx, gy) walkable tiles the player can move to
+        self.reachable_rooms = set()  # room type strings the player can enter this turn
 
     def _create_grid(self):
         grid = []
@@ -75,10 +96,6 @@ class CluedoGame:
                 pixel_y = gy * CELL_SIZE + CELL_SIZE // 2
                 color = self.mask_image.get_at((pixel_x, pixel_y))[:3]
                 room_type = COLOR_TO_ROOM.get(color, "WALL")
-
-                if (gx, gy) in FORCED_DOOR_CELLS:
-                    room_type = "DOOR"
-
                 row.append({
                     "type": room_type,
                     "walkable": room_type in ["HALLWAY", "DOOR", "START"],
@@ -87,29 +104,257 @@ class CluedoGame:
             grid.append(row)
         return grid
 
+    def next_turn(self):
+        """Switches to the next player and resets movement state."""
+        self.current_turn_index = (self.current_turn_index + 1) % len(CHARACTER_ORDER)
+        self.current_turn = CHARACTER_ORDER[self.current_turn_index]
+        self.phase = "ROLL"
+        self.dice_result = (0, 0)
+        self.steps = 0
+        self.reachable = set()
+        self.reachable_rooms = set()
+        print(f"It is now {self.current_turn}'s turn.")
+
+    # ------------------------------------------------------------------
+    # MOVEMENT SYSTEM
+    # ------------------------------------------------------------------
+
     def _build_door_room_map(self):
-        """Map each door cell to the room(s) it actually connects to by adjacency."""
+        """Map each DOOR cell to the set of room types it is adjacent to."""
         door_map = {}
         directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-
         for gy in range(self.grid_height):
             for gx in range(self.grid_width):
                 if self.grid[gy][gx]["type"] != "DOOR":
                     continue
-
-                connected_rooms = set()
+                connected = set()
                 for dx, dy in directions:
                     nx, ny = gx + dx, gy + dy
                     if 0 <= nx < self.grid_width and 0 <= ny < self.grid_height:
-                        neighbor = self.grid[ny][nx]
-                        if neighbor["is_room"]:
-                            connected_rooms.add(neighbor["type"])
-
-                door_map[(gx, gy)] = connected_rooms
-
+                        cell = self.grid[ny][nx]
+                        if cell["is_room"]:
+                            connected.add(cell["type"])
+                door_map[(gx, gy)] = connected
         return door_map
 
+    def _build_room_anchor_map(self):
+        """Pick one stable tile per room type for teleports (e.g., secret passages)."""
+        anchors = {}
+        for gy in range(self.grid_height):
+            for gx in range(self.grid_width):
+                cell = self.grid[gy][gx]
+                if cell["is_room"] and cell["type"] not in anchors:
+                    anchors[cell["type"]] = (gx, gy)
+        return anchors
+
+    def _is_occupied_by_other(self, gx, gy):
+        """True if another player occupies this walkable tile."""
+        for name, data in self.characters.items():
+            if name != self.current_turn and data["position"] == (gx, gy):
+                return True
+        return False
+
+    def _current_door_rooms(self):
+        """Rooms that can be entered right now from the current tile."""
+        gx, gy = self.characters[self.current_turn]["position"]
+        if self.steps < 1:
+            return set()
+        if self.grid[gy][gx]["type"] != "DOOR":
+            return set()
+        return set(self.door_to_rooms.get((gx, gy), set()))
+
+    def _current_secret_passage_destination(self):
+        """Return the passage destination room for the current player, if available."""
+        gx, gy = self.characters[self.current_turn]["position"]
+        current_cell = self.grid[gy][gx]
+        if not current_cell["is_room"]:
+            return None
+        return SECRET_PASSAGES.get(current_cell["type"])
+
+    def _shortest_walk_distance(self, start, goal, max_steps):
+        """Shortest distance bounded by max_steps, including the first step out of a room."""
+        if start == goal:
+            return 0
+
+        occupied = {
+            data["position"]
+            for name, data in self.characters.items()
+            if name != self.current_turn
+        }
+
+        queue = deque()
+        visited = set()
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        start_gx, start_gy = start
+        start_cell = self.grid[start_gy][start_gx]
+
+        if start_cell["is_room"]:
+            room_type = start_cell["type"]
+            for (dgx, dgy), rooms in self.door_to_rooms.items():
+                if room_type not in rooms or (dgx, dgy) in occupied:
+                    continue
+                if max_steps < 1:
+                    continue
+                if (dgx, dgy) == goal:
+                    return 1
+                visited.add((dgx, dgy))
+                queue.append((dgx, dgy, 1))
+        else:
+            visited.add(start)
+            queue.append((start_gx, start_gy, 0))
+
+        while queue:
+            gx, gy, dist = queue.popleft()
+            if dist >= max_steps:
+                continue
+
+            for dx, dy in directions:
+                nx, ny = gx + dx, gy + dy
+                if not (0 <= nx < self.grid_width and 0 <= ny < self.grid_height):
+                    continue
+                if (nx, ny) in visited:
+                    continue
+
+                cell = self.grid[ny][nx]
+                if not cell["walkable"]:
+                    continue
+                if (nx, ny) in occupied:
+                    continue
+
+                ndist = dist + 1
+                if (nx, ny) == goal:
+                    return ndist
+
+                visited.add((nx, ny))
+                queue.append((nx, ny, ndist))
+
+        return None
+
+    def roll_dice(self):
+        """Roll two dice, compute reachable cells, and enter MOVE phase."""
+        if self.phase != "ROLL":
+            return
+        d1, d2 = random.randint(1, 6), random.randint(1, 6)
+        self.dice_result = (d1, d2)
+        self.steps = d1 + d2
+        gx, gy = self.characters[self.current_turn]["position"]
+        self.reachable, _ = self._compute_reachable(gx, gy, self.steps)
+        self.reachable_rooms = self._current_door_rooms()
+        self.phase = "MOVE"
+        print(f"{self.current_turn} rolled {d1} + {d2} = {self.steps}")
+
+    def _compute_reachable(self, start_gx, start_gy, steps):
+        """
+        BFS that finds every walkable tile reachable in up to `steps` moves and
+        every room reachable by entering through an adjacent door.
+        Returns (reachable_cells: set, reachable_rooms: set).
+        """
+        occupied = {
+            data["position"]
+            for name, data in self.characters.items()
+            if name != self.current_turn
+        }
+
+        reachable = set()
+        reachable_rooms = set()
+        visited = {}  # (gx, gy) -> max steps_remaining when reached
+        queue = deque()
+        directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+        start_cell = self.grid[start_gy][start_gx]
+
+        if start_cell["is_room"]:
+            # Player is inside a room — seed BFS from every exit door
+            room_type = start_cell["type"]
+            for (dgx, dgy), rooms in self.door_to_rooms.items():
+                if room_type in rooms and steps >= 1 and (dgx, dgy) not in occupied:
+                    rem = steps - 1
+                    if (dgx, dgy) not in visited or visited[(dgx, dgy)] < rem:
+                        visited[(dgx, dgy)] = rem
+                        queue.append((dgx, dgy, rem))
+                        reachable.add((dgx, dgy))
+        else:
+            # Player is on a hallway / door / start tile
+            visited[(start_gx, start_gy)] = steps
+            queue.append((start_gx, start_gy, steps))
+
+        while queue:
+            gx, gy, remaining = queue.popleft()
+
+            # Discard stale entries
+            if visited.get((gx, gy), -1) > remaining:
+                continue
+
+            cell = self.grid[gy][gx]
+
+            # From a door tile with at least 1 move left, rooms can be entered.
+            if cell["type"] == "DOOR" and remaining >= 1:
+                for room_type in self.door_to_rooms.get((gx, gy), set()):
+                    reachable_rooms.add(room_type)
+
+            if remaining == 0:
+                continue
+
+            # Expand to adjacent walkable tiles
+            for dx, dy in directions:
+                nx, ny = gx + dx, gy + dy
+                if not (0 <= nx < self.grid_width and 0 <= ny < self.grid_height):
+                    continue
+                ncell = self.grid[ny][nx]
+                if not ncell["walkable"]:
+                    continue
+                if (nx, ny) in occupied:
+                    continue
+                rem = remaining - 1
+                if (nx, ny) not in visited or visited[(nx, ny)] < rem:
+                    visited[(nx, ny)] = rem
+                    queue.append((nx, ny, rem))
+                    reachable.add((nx, ny))
+
+        return reachable, reachable_rooms
+
+    def skip_move(self):
+        """Player stays stationary this turn (rule 15)."""
+        if self.phase not in ["ROLL", "MOVE"]:
+            return
+        print(f"{self.current_turn} stays put.")
+        self.next_turn()
+
+    def use_secret_passage(self):
+        """Use a secret passage if the current player is in a corner room that has one."""
+        if self.phase not in ["ROLL", "MOVE"]:
+            return
+
+        gx, gy = self.characters[self.current_turn]["position"]
+        current_cell = self.grid[gy][gx]
+        if not current_cell["is_room"]:
+            print("You must be inside Study, Kitchen, Lounge, or Conservatory to use a secret passage.")
+            return
+
+        source_room = current_cell["type"]
+        destination_room = self._current_secret_passage_destination()
+        if not destination_room:
+            print("This room has no secret passage.")
+            return
+
+        destination_pos = self.room_anchor_by_type.get(destination_room)
+        if not destination_pos:
+            print(f"Could not find destination room tile for {destination_room}.")
+            return
+
+        self.characters[self.current_turn]["position"] = destination_pos
+        self.reachable = set()
+        self.reachable_rooms = set()
+        self.steps = 0
+        print(f"{self.current_turn} used secret passage: {source_room} -> {destination_room}")
+        self.next_turn()
+
     def handle_move(self, target_gx, target_gy):
+        """Validate and execute movement while preserving remaining steps."""
+        if self.phase != "MOVE":
+            print("Roll the dice first! (Press SPACE)")
+            return
+
         if not (0 <= target_gx < self.grid_width and 0 <= target_gy < self.grid_height):
             return
 
@@ -118,48 +363,79 @@ class CluedoGame:
         current_cell = self.grid[current_gy][current_gx]
         target_cell = self.grid[target_gy][target_gx]
 
-        # --- CORRECTED SECRET PASSAGE LOGIC ---
-        # 1. Check if the player is currently standing on a secret passage tile
-        if (current_gx, current_gy) in SECRET_PASSAGES:
-            dest_gx, dest_gy = SECRET_PASSAGES[(current_gx, current_gy)]
-            
-            # 2. ONLY teleport if they click the EXACT destination tile
-            # (Or click anywhere inside the destination room)
-            if (target_gx, target_gy) == (dest_gx, dest_gy):
-                char["position"] = (dest_gx, dest_gy)
-                print(f"{self.current_turn} used the Secret Passage to {target_cell['type']}!")
-                # In Cluedo, using a passage ends your movement turn
-                self.next_turn() 
-                return 
-
-        # --- STANDARD MOVEMENT LOGIC ---
-        # If we didn't teleport, check if the click was a valid walk move
-        if target_cell["type"] == "WALL": 
-            return
-        
-        # Room Entry Logic (Must be on a DOOR to enter)
+        # Room entry: must currently be standing on the specific door.
         if target_cell["is_room"]:
-            if current_cell["type"] != "DOOR":
-                print("You must use a door to enter a room!")
+            if self.steps < 1:
+                print("No movement left to enter a room.")
                 return
-
+            if current_cell["type"] != "DOOR":
+                print("You must stand on a door tile before entering a room.")
+                return
             connected_rooms = self.door_to_rooms.get((current_gx, current_gy), set())
             if target_cell["type"] not in connected_rooms:
                 print(f"This door does not lead to {target_cell['type']}!")
                 return
 
-        # Update position
+            # Entering a room ends movement for the turn (rule 14).
+            char["position"] = (target_gx, target_gy)
+            print(f"Moved {self.current_turn} into {target_cell['type']}")
+            self.next_turn()
+            return
+
+        # Standard hallway movement.
+        if not target_cell["walkable"]:
+            print("That tile is not walkable.")
+            return
+        if self._is_occupied_by_other(target_gx, target_gy):
+            print("That square is occupied.")
+            return
+        if (target_gx, target_gy) not in self.reachable:
+            print("Target is out of range for your remaining movement.")
+            return
+
+        distance = self._shortest_walk_distance((current_gx, current_gy), (target_gx, target_gy), self.steps)
+        if distance is None:
+            print("No valid path to that tile.")
+            return
+
         char["position"] = (target_gx, target_gy)
-        print(f"Moved {self.current_turn} to {target_cell['type']}")
+        self.steps -= distance
+        print(f"Moved {self.current_turn} to ({target_gx},{target_gy}) [{target_cell['type']}], {self.steps} step(s) left")
+
+        if self.steps <= 0:
+            self.next_turn()
+            return
+
+        # Keep turn active with updated movement budget.
+        self.reachable, _ = self._compute_reachable(target_gx, target_gy, self.steps)
+        self.reachable_rooms = self._current_door_rooms()
+
+        # If standing on a door after moving, show room-entry options for the next click.
+        self.reachable_rooms = self._current_door_rooms()
 
     def draw(self):
-        self.screen.fill((0, 0, 0))
+        """Main rendering method."""
+        self.screen.fill((0, 0, 0)) # Clear screen
+        y_off = UI_BAR_HEIGHT # Offset for board drawing
         
-        # All board elements are offset by UI_BAR_HEIGHT (30px)
-        y_off = UI_BAR_HEIGHT
-        
+        # Draw the physical board
         self.screen.blit(self.board_image, (0, y_off))
 
+        # Draw reachable-cell highlights
+        if self.reachable or self.reachable_rooms:
+            tile_hl = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
+            tile_hl.fill((0, 220, 0, 80))     # green tint for walkable tiles
+            room_hl = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
+            room_hl.fill((0, 220, 0, 55))     # lighter green for room areas
+            for (gx, gy) in self.reachable:
+                self.screen.blit(tile_hl, (gx * CELL_SIZE, gy * CELL_SIZE + y_off))
+            if self.reachable_rooms:
+                for gy in range(self.grid_height):
+                    for gx in range(self.grid_width):
+                        if self.grid[gy][gx]["type"] in self.reachable_rooms:
+                            self.screen.blit(room_hl, (gx * CELL_SIZE, gy * CELL_SIZE + y_off))
+
+        # Draw Room Overlays (Toggleable)
         if self.show_rooms:
             for gy in range(self.grid_height):
                 for gx in range(self.grid_width):
@@ -171,45 +447,77 @@ class CluedoGame:
                         s.fill(color)
                         self.screen.blit(s, (gx * CELL_SIZE, gy * CELL_SIZE + y_off))
 
+        # Draw Grid (Toggleable)
         if self.show_grid:
             for x in range(0, self.board_width, CELL_SIZE):
                 pygame.draw.line(self.screen, GRID_COLOR, (x, y_off), (x, self.board_height + y_off))
             for y in range(0, self.board_height + CELL_SIZE, CELL_SIZE):
                 pygame.draw.line(self.screen, GRID_COLOR, (0, y + y_off), (self.board_width, y + y_off))
 
+        # Draw Players
         for name, data in self.characters.items():
             gx, gy = data["position"]
             center = (gx * CELL_SIZE + CELL_SIZE // 2, gy * CELL_SIZE + CELL_SIZE // 2 + y_off)
-            pygame.draw.circle(self.screen, (0, 0, 0), center, (CELL_SIZE // 2) - 2)
+            
+            # Draw Token
+            pygame.draw.circle(self.screen, (0, 0, 0), center, (CELL_SIZE // 2) - 2) # Shadow/Border
             pygame.draw.circle(self.screen, data["color"], center, (CELL_SIZE // 2) - 4)
+            
+            # Highlight current player with a white ring
+            if name == self.current_turn:
+                pygame.draw.circle(self.screen, (255, 255, 255), center, (CELL_SIZE // 2) - 1, 2)
 
         self.draw_ui()
 
     def draw_ui(self):
-        font = pygame.font.SysFont("Arial", 16)
-        pygame.draw.rect(self.screen, (20, 20, 20), (0, 0, self.board_width, UI_BAR_HEIGHT))
-        pygame.draw.line(self.screen, (100, 100, 100), (0, UI_BAR_HEIGHT), (self.board_width, UI_BAR_HEIGHT))
-        
-        turn_text = font.render(f"Turn: {self.current_turn}", True, (255, 255, 255))
-        self.screen.blit(turn_text, (15, 7))
-        
-        controls = font.render("G: Toggle Grid | R: Toggle Rooms | ESC: Quit", True, (180, 180, 180))
-        self.screen.blit(controls, (self.board_width - 320, 7))
+        """Draws the top status bar: turn, dice, phase, and key hints."""
+        font = pygame.font.SysFont("Arial", 16, bold=True)
+        pygame.draw.rect(self.screen, (30, 30, 30), (0, 0, self.board_width, UI_BAR_HEIGHT))
+        pygame.draw.line(self.screen, (80, 80, 80), (0, UI_BAR_HEIGHT), (self.board_width, UI_BAR_HEIGHT))
+
+        # Turn indicator
+        turn_label = font.render("Turn: ", True, (200, 200, 200))
+        name_text  = font.render(self.current_turn, True, self.characters[self.current_turn]["color"])
+        self.screen.blit(turn_label, (8, 7))
+        self.screen.blit(name_text,  (52, 7))
+
+        # Dice display
+        passage_hint = "   P: Passage" if self._current_secret_passage_destination() else ""
+        if self.phase == "ROLL":
+            dice_text = font.render(f"  |  SPACE: Roll dice   S: Stay{passage_hint}", True, (180, 180, 60))
+        else:
+            d1, d2 = self.dice_result
+            dice_text = font.render(
+                f"  |  Rolled: {d1}+{d2} | Steps left: {self.steps} | Click to move   S: Stay{passage_hint}",
+                True, (60, 220, 60)
+            )
+        self.screen.blit(dice_text, (180, 7))
+
+        # Right-hand controls hint
+        hint = font.render("G: Grid  R: Rooms  ESC: Quit", True, (120, 120, 120))
+        self.screen.blit(hint, (self.board_width - hint.get_width() - 8, 7))
 
     def handle_input(self):
+        """Processes keyboard and mouse events."""
         for event in pygame.event.get():
-            if event.type == pygame.QUIT:
+            if event.type == pygame.QUIT: 
                 return False
             
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = pygame.mouse.get_pos()
-                # Adjust mouse click by subtracting the UI bar height
+                # Subtract UI height from mouse Y coordinate to align with grid
                 gx, gy = mx // CELL_SIZE, (my - UI_BAR_HEIGHT) // CELL_SIZE
                 self.handle_move(gx, gy)
                 
             if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_g:
-                    self.show_grid = not self.show_grid  # Toggle logic
+                if event.key == pygame.K_SPACE:
+                    self.roll_dice()
+                elif event.key == pygame.K_s:
+                    self.skip_move()
+                elif event.key == pygame.K_p:
+                    self.use_secret_passage()
+                elif event.key == pygame.K_g:
+                    self.show_grid = not self.show_grid
                 elif event.key == pygame.K_r:
                     self.show_rooms = not self.show_rooms
                 elif event.key == pygame.K_ESCAPE:
@@ -217,9 +525,11 @@ class CluedoGame:
         return True
 
     def run(self):
+        """Game loop."""
         clock = pygame.time.Clock()
         while True:
-            if not self.handle_input(): break
+            if not self.handle_input(): 
+                break
             self.draw()
             pygame.display.flip()
             clock.tick(60)
