@@ -163,8 +163,16 @@ class CluedoGame:
             return set()
         return set(self.door_to_rooms.get((gx, gy), set()))
 
+    def _current_secret_passage_destination(self):
+        """Return the passage destination room for the current player, if available."""
+        gx, gy = self.characters[self.current_turn]["position"]
+        current_cell = self.grid[gy][gx]
+        if not current_cell["is_room"]:
+            return None
+        return SECRET_PASSAGES.get(current_cell["type"])
+
     def _shortest_walk_distance(self, start, goal, max_steps):
-        """Shortest distance through walkable tiles only, bounded by max_steps."""
+        """Shortest distance bounded by max_steps, including the first step out of a room."""
         if start == goal:
             return 0
 
@@ -174,9 +182,26 @@ class CluedoGame:
             if name != self.current_turn
         }
 
-        queue = deque([(start[0], start[1], 0)])
-        visited = {start}
+        queue = deque()
+        visited = set()
         directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        start_gx, start_gy = start
+        start_cell = self.grid[start_gy][start_gx]
+
+        if start_cell["is_room"]:
+            room_type = start_cell["type"]
+            for (dgx, dgy), rooms in self.door_to_rooms.items():
+                if room_type not in rooms or (dgx, dgy) in occupied:
+                    continue
+                if max_steps < 1:
+                    continue
+                if (dgx, dgy) == goal:
+                    return 1
+                visited.add((dgx, dgy))
+                queue.append((dgx, dgy, 1))
+        else:
+            visited.add(start)
+            queue.append((start_gx, start_gy, 0))
 
         while queue:
             gx, gy, dist = queue.popleft()
@@ -296,29 +321,31 @@ class CluedoGame:
         self.next_turn()
 
     def use_secret_passage(self):
-        """Use a secret passage if the player's current room has one (rule 16)."""
-        if self.phase != "ROLL":
-            print("Use secret passage before rolling.")
+        """Use a secret passage if the current player is in a corner room that has one."""
+        if self.phase not in ["ROLL", "MOVE"]:
             return
 
         gx, gy = self.characters[self.current_turn]["position"]
         current_cell = self.grid[gy][gx]
         if not current_cell["is_room"]:
-            print("You must be inside a room to use a secret passage.")
+            print("You must be inside Study, Kitchen, Lounge, or Conservatory to use a secret passage.")
             return
 
         source_room = current_cell["type"]
-        if source_room not in SECRET_PASSAGES:
+        destination_room = self._current_secret_passage_destination()
+        if not destination_room:
             print("This room has no secret passage.")
             return
 
-        destination_room = SECRET_PASSAGES[source_room]
         destination_pos = self.room_anchor_by_type.get(destination_room)
         if not destination_pos:
             print(f"Could not find destination room tile for {destination_room}.")
             return
 
         self.characters[self.current_turn]["position"] = destination_pos
+        self.reachable = set()
+        self.reachable_rooms = set()
+        self.steps = 0
         print(f"{self.current_turn} used secret passage: {source_room} -> {destination_room}")
         self.next_turn()
 
@@ -455,12 +482,13 @@ class CluedoGame:
         self.screen.blit(name_text,  (52, 7))
 
         # Dice display
+        passage_hint = "   P: Passage" if self._current_secret_passage_destination() else ""
         if self.phase == "ROLL":
-            dice_text = font.render("  |  SPACE: Roll dice   S: Stay   P: Passage", True, (180, 180, 60))
+            dice_text = font.render(f"  |  SPACE: Roll dice   S: Stay{passage_hint}", True, (180, 180, 60))
         else:
             d1, d2 = self.dice_result
             dice_text = font.render(
-                f"  |  Rolled: {d1}+{d2} | Steps left: {self.steps} | Click to move   S: Stay",
+                f"  |  Rolled: {d1}+{d2} | Steps left: {self.steps} | Click to move   S: Stay{passage_hint}",
                 True, (60, 220, 60)
             )
         self.screen.blit(dice_text, (180, 7))
