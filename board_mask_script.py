@@ -1,12 +1,12 @@
 import pygame
 import os
 
-# --- CONFIGURATION ---
+# Configuration
 BOARD_IMG = "/home/nabil-faizal-mussa/Desktop/Cluedo_SE_project_2026/Assets_images/game board.png"
 MASK_OUTPUT = "/home/nabil-faizal-mussa/Desktop/Cluedo_SE_project_2026/Assets_images/board_mask.png"
 
-# Room Palette mapping keys to (Name, Color)
-# --- COMPLETE ROOM PALETTE ---
+# Room palette mapping keys to names and colours
+# Complete room palette
 ROOMS = {
     # Numbers 1-9
     pygame.K_1: ("HALLWAY", (255, 255, 255)),     # White
@@ -29,7 +29,7 @@ pygame.init()
 img = pygame.image.load(BOARD_IMG)
 screen = pygame.display.set_mode(img.get_size())
 
-# --- PERSISTENCE LOGIC ---
+# Persistence logic
 if os.path.exists(MASK_OUTPUT):
     print("Found existing mask! Loading progress...")
     mask_surface = pygame.image.load(MASK_OUTPUT).convert()

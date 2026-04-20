@@ -1,20 +1,32 @@
 import pygame
 import sys
 import random
+import textwrap
 from collections import deque
+
+from cluedo_card_setup import ROOMS, SUSPECTS, WEAPONS, setup_game
+from guess_cluedo import ai_turn, make_accusation, make_suggestion
 
 # Initialize Pygame
 pygame.init()
 
-# --- CONFIGURATION ---
+# Settings
 BOARD_IMG = "Assets_images/game board.png"
 MASK_IMG = "Assets_images/board_mask.png"
 
 CELL_SIZE = 20
 UI_BAR_HEIGHT = 30 
 GRID_COLOR = (60, 60, 60) # Slightly darker for better visibility
+SIDE_PANEL_WIDTH = 360
+PANEL_BG = (28, 28, 28)
+PANEL_ACCENT = (75, 75, 75)
+TEXT_COLOR = (235, 235, 235)
+MUTED_TEXT = (170, 170, 170)
+DEFAULT_HUMAN_PLAYERS = {"Miss Scarlett"}
+ENABLE_AI_PLAYERS = False
+AI_TURN_DELAY_MS = 900
 
-# --- CHARACTER ORDER & DATA ---
+# Player order / starting spots
 CHARACTER_ORDER = [
     "Miss Scarlett", 
     "Col. Mustard", 
@@ -33,13 +45,31 @@ CHARACTERS = {
     "Prof. Plum":    {"color": (128, 0, 128),  "position": (2, 7)},
 }
 
-# --- SECRET PASSAGES ---
-# Room-to-room mapping so passage works anywhere inside the source room.
+# Secret passages
+# Corner rooms connect to the room opposite them.
 SECRET_PASSAGES = {
     "STUDY": "KITCHEN",
     "KITCHEN": "STUDY",
     "LOUNGE": "CONSERVATORY",
     "CONSERVATORY": "LOUNGE",
+}
+
+WEAPON_TOKEN_COLORS = {
+    "Candlestick": (255, 215, 0),
+    "Knife": (210, 210, 210),
+    "Lead Pipe": (120, 140, 160),
+    "Revolver": (90, 90, 90),
+    "Rope": (170, 130, 85),
+    "Wrench": (120, 220, 255),
+}
+
+WEAPON_TOKEN_LABELS = {
+    "Candlestick": "Ca",
+    "Knife": "Kn",
+    "Lead Pipe": "LP",
+    "Revolver": "Re",
+    "Rope": "Ro",
+    "Wrench": "Wr",
 }
 
 COLOR_TO_ROOM = {
@@ -62,40 +92,304 @@ class CluedoGame:
             sys.exit()
         
         self.board_width, self.board_height = self.board_image.get_size()
-        # Create screen with extra height for UI
-        self.screen = pygame.display.set_mode((self.board_width, self.board_height + UI_BAR_HEIGHT))
+        self.screen = pygame.display.set_mode((self.board_width + SIDE_PANEL_WIDTH, self.board_height + UI_BAR_HEIGHT))
         pygame.display.set_caption("Cluedo Game Engine")
 
         self.grid_width = self.board_width // CELL_SIZE
         self.grid_height = self.board_height // CELL_SIZE
+
+        self.font = pygame.font.SysFont("Arial", 16)
+        self.small_font = pygame.font.SysFont("Arial", 13)
+        self.tiny_font = pygame.font.SysFont("Arial", 12)
         
         self.grid = self._create_grid()
         self.door_to_rooms = self._build_door_room_map()
+        self.room_slots_by_type = self._build_room_slot_map()
         self.room_anchor_by_type = self._build_room_anchor_map()
-        self.characters = CHARACTERS
+        self.characters = {name: data.copy() for name, data in CHARACTERS.items()}
+        self.active_character_names = CHARACTER_ORDER[:]
         self.show_rooms = False
-        self.show_grid = True
+        self.show_grid = False
 
-        # Turn management
+        # Main game state
+        self.players = []
+        self.player_by_name = {}
+        self.turn_order = []
         self.current_turn_index = 0
-        self.current_turn = CHARACTER_ORDER[self.current_turn_index]
+        self.current_turn = CHARACTER_ORDER[0]
+        self.envelope = None
+        self.weapon_locations = {}
+        self.message_log = []
+        self.modal_state = None
+        self.game_over = False
+        self.winner = None
+        self.pending_ai_turn = False
+        self.ai_action_due_at = 0
+        self.ai_enabled = False
+        self.show_help_overlay = True
+        self.has_suggested_this_turn = False
+        self.awaiting_turn_handoff = False
+        self.private_info_visible = False
+        self.note_scroll_offset = 0
+        self.game_state = "MENU"
+        self.menu_player_count = 4
+        self.menu_human_flags = {
+            name: ((not ENABLE_AI_PLAYERS) or (name in DEFAULT_HUMAN_PLAYERS))
+            for name in CHARACTER_ORDER
+        }
+        self.menu_cursor = 0
 
-        # Movement state
-        self.phase = "ROLL"       # "ROLL" = waiting to roll | "MOVE" = pick a destination
+        # Turn movement state
+        self.phase = "ROLL"       # ROLL = waiting to roll, MOVE = choose where to go
         self.dice_result = (0, 0)
         self.steps = 0
-        self.reachable = set()        # (gx, gy) walkable tiles the player can move to
-        self.reachable_rooms = set()  # room type strings the player can enter this turn
+        self.reachable = set()        # Walkable tiles the player can still reach
+        self.reachable_rooms = set()  # Rooms the player can still enter this turn
+
+        self._sync_menu_selection()
+        self.log_message("Choose players in the setup menu and press Enter to start.")
+
+    def _sync_menu_selection(self):
+        self.menu_player_count = max(2, min(len(CHARACTER_ORDER), self.menu_player_count))
+        self.menu_cursor = max(0, min(self.menu_cursor, self.menu_player_count + 1))
+        for name in CHARACTER_ORDER:
+            self.menu_human_flags.setdefault(name, True)
+
+    def _prepare_private_view(self):
+        if not self.players or self.game_over:
+            self.awaiting_turn_handoff = False
+            self.private_info_visible = False
+            return
+
+        current_player = self._current_player()
+        if current_player.is_human:
+            self.awaiting_turn_handoff = True
+            self.private_info_visible = False
+        else:
+            self.awaiting_turn_handoff = False
+            self.private_info_visible = False
+
+    def _start_selected_game(self):
+        self._sync_menu_selection()
+        self.active_character_names = CHARACTER_ORDER[:self.menu_player_count]
+        self.characters = {name: data.copy() for name, data in CHARACTERS.items()}
+        self.players = []
+        self.player_by_name = {}
+        self.turn_order = []
+        self.current_turn_index = 0
+        self.current_turn = self.active_character_names[0]
+        self.envelope = None
+        self.weapon_locations = {}
+        self.message_log = []
+        self.modal_state = None
+        self.game_over = False
+        self.winner = None
+        self.pending_ai_turn = False
+        self.ai_action_due_at = 0
+        self.has_suggested_this_turn = False
+        self.phase = "ROLL"
+        self.dice_result = (0, 0)
+        self.steps = 0
+        self.reachable = set()
+        self.reachable_rooms = set()
+        self.awaiting_turn_handoff = False
+        self.private_info_visible = False
+        self.note_scroll_offset = 0
+        self.game_state = "PLAYING"
+        self._place_spare_characters()
+        self._setup_card_game()
+
+    def _return_to_menu(self):
+        self.game_state = "MENU"
+        self.modal_state = None
+        self.pending_ai_turn = False
+        self.ai_action_due_at = 0
+        self.phase = "ROLL"
+        self.reachable = set()
+        self.reachable_rooms = set()
+        self.awaiting_turn_handoff = False
+        self.private_info_visible = False
+        self.note_scroll_offset = 0
+        self.message_log = []
+        self.log_message("Back in the setup menu. Adjust the players and press Enter to start.")
+
+    def _setup_card_game(self):
+        names = CHARACTER_ORDER[:self.menu_player_count]
+        human_flags = [self.menu_human_flags.get(name, True) for name in names]
+        self.ai_enabled = any(not flag for flag in human_flags)
+        self.players, self.envelope = setup_game(names, human_flags)
+
+        player_map = {player.name: player for player in self.players}
+        ordered_names = [name for name in CHARACTER_ORDER if name in player_map]
+        self.players = [player_map[name] for name in ordered_names]
+        self.player_by_name = {player.name: player for player in self.players}
+        self.turn_order = ordered_names
+        self.current_turn_index = 0
+        self.current_turn = self.turn_order[0]
+        self._setup_weapon_tokens()
+        self._schedule_ai_turn()
+        self._prepare_private_view()
+        self.log_message("Miss Scarlett goes first.")
+
+        humans = [player.name for player in self.players if player.is_human]
+        ai_players = [player.name for player in self.players if not player.is_human]
+        self.log_message("Card setup complete.")
+        self.log_message(f"Players: {', '.join(names)}")
+        self.log_message(f"Humans: {', '.join(humans) if humans else 'none'}")
+        self.log_message(f"AI players: {', '.join(ai_players) if ai_players else 'none'}")
+        self.log_message(f"Turn order: {' -> '.join(self.turn_order)}")
+        self.log_message("Goal: solve the suspect, weapon, and room in the envelope.")
+        self.log_message("Press H to show or hide the play guide.")
+        self.log_message(f"It is now {self.current_turn}'s turn.")
+
+    def _roll_for_order(self, players):
+        self.log_message("Rolling to decide turn order...")
+        rolls = {}
+        for player in players:
+            rolls[player.name] = random.randint(1, 6)
+            self.log_message(f"{player.name} rolled {rolls[player.name]}")
+        return self._resolve_turn_ties(rolls)
+
+    def _resolve_turn_ties(self, roll_dict):
+        by_roll = {}
+        for name, value in roll_dict.items():
+            by_roll.setdefault(value, []).append(name)
+
+        final_order = []
+        for value in sorted(by_roll.keys(), reverse=True):
+            group = by_roll[value]
+            if len(group) == 1:
+                final_order.append(group[0])
+                continue
+
+            self.log_message(f"Tie between {', '.join(group)}. Re-rolling...")
+            reroll = {}
+            for name in group:
+                reroll[name] = random.randint(1, 6)
+                self.log_message(f"{name} rolled {reroll[name]}")
+            final_order.extend(self._resolve_turn_ties(reroll))
+
+        return final_order
+
+    def _current_player(self):
+        return self.player_by_name[self.current_turn]
+
+    def _human_viewer(self):
+        for player in self.players:
+            if player.is_human:
+                return player
+        return self._current_player()
+
+    def _players_from_current_turn(self):
+        ordered_names = self.turn_order[self.current_turn_index:] + self.turn_order[:self.current_turn_index]
+        return [self.player_by_name[name] for name in ordered_names]
+
+    def _current_room_name(self, name=None):
+        actor_name = name or self.current_turn
+        gx, gy = self.characters[actor_name]["position"]
+        cell = self.grid[gy][gx]
+        return cell["type"] if cell["is_room"] else None
+
+    def _can_accuse_now(self):
+        return self.phase == "ACTION" and self.has_suggested_this_turn
+
+    def _schedule_ai_turn(self):
+        if not self.ai_enabled or not self.players:
+            self.pending_ai_turn = False
+            self.ai_action_due_at = 0
+            return
+
+        self.pending_ai_turn = (not self.game_over) and (not self._current_player().is_human)
+        self.ai_action_due_at = pygame.time.get_ticks() + AI_TURN_DELAY_MS if self.pending_ai_turn else 0
+
+    def _should_log_message(self, message):
+        text = str(message)
+        quiet_prefixes = (
+            "Rolling to decide turn order...",
+            "Players:",
+            "Humans:",
+            "AI players:",
+            "Turn order:",
+            "Goal:",
+            "Press H to show or hide the play guide.",
+            "It is now ",
+        )
+        quiet_contains = (
+            " rolled ",
+            " moved to (",
+            " entered ",
+            "Door options:",
+            " ends their turn.",
+            " used secret passage:",
+            " could not move this turn.",
+            "Press A to accuse or S to end your turn.",
+        )
+
+        if any(text.startswith(prefix) for prefix in quiet_prefixes):
+            return False
+        if any(token in text for token in quiet_contains):
+            return False
+        return True
+
+    def _log_style(self, message):
+        text = str(message)
+        if "suggests:" in text:
+            return "Suggestion", (120, 220, 255)
+        if "disproved" in text or "Nobody could disprove" in text:
+            return "Clue", (180, 220, 120)
+        if "accuses:" in text:
+            return "Accusation", (255, 205, 120)
+        if "CORRECT!" in text:
+            return "Win", (120, 240, 150)
+        if "WRONG!" in text or "Game over" in text:
+            return "Result", (255, 150, 150)
+        return "Info", TEXT_COLOR
+
+    def log_message(self, message):
+        text = str(message)
+        if not self._should_log_message(text):
+            return
+        label, color = self._log_style(text)
+        self.message_log.append({"label": label, "text": text, "color": color})
+        self.message_log = self.message_log[-10:]
+
+    def _classify_cell(self, gx, gy):
+        """Look at the whole cell so thin door markings still get picked up."""
+        color_counts = {}
+        start_x = gx * CELL_SIZE
+        start_y = gy * CELL_SIZE
+
+        for py in range(start_y, min(start_y + CELL_SIZE, self.board_height)):
+            for px in range(start_x, min(start_x + CELL_SIZE, self.board_width)):
+                color = self.mask_image.get_at((px, py))[:3]
+                color_counts[color] = color_counts.get(color, 0) + 1
+
+        door_pixels = color_counts.get((255, 20, 147), 0)
+        start_pixels = color_counts.get((150, 0, 0), 0)
+
+        if door_pixels >= 100:
+            return "DOOR"
+        if start_pixels >= 100:
+            return "START"
+
+        ranked_colors = sorted(
+            (
+                (count, color)
+                for color, count in color_counts.items()
+                if color in COLOR_TO_ROOM and color != (0, 0, 0)
+            ),
+            reverse=True,
+        )
+        if ranked_colors:
+            return COLOR_TO_ROOM[ranked_colors[0][1]]
+        return "WALL"
 
     def _create_grid(self):
         grid = []
         for gy in range(self.grid_height):
             row = []
             for gx in range(self.grid_width):
-                pixel_x = gx * CELL_SIZE + CELL_SIZE // 2
-                pixel_y = gy * CELL_SIZE + CELL_SIZE // 2
-                color = self.mask_image.get_at((pixel_x, pixel_y))[:3]
-                room_type = COLOR_TO_ROOM.get(color, "WALL")
+                room_type = self._classify_cell(gx, gy)
                 row.append({
                     "type": room_type,
                     "walkable": room_type in ["HALLWAY", "DOOR", "START"],
@@ -105,22 +399,39 @@ class CluedoGame:
         return grid
 
     def next_turn(self):
-        """Switches to the next player and resets movement state."""
-        self.current_turn_index = (self.current_turn_index + 1) % len(CHARACTER_ORDER)
-        self.current_turn = CHARACTER_ORDER[self.current_turn_index]
+        """Move to the next active player and reset the turn state."""
+        active_players = [player for player in self.players if not player.eliminated]
+        if len(active_players) <= 1:
+            self.game_over = True
+            self.winner = active_players[0] if active_players else None
+            if self.winner:
+                self.log_message(f"{self.winner.name} is the last player standing.")
+            else:
+                self.log_message("No active players remain. Game over.")
+            return
+
+        for _ in range(len(self.turn_order)):
+            self.current_turn_index = (self.current_turn_index + 1) % len(self.turn_order)
+            next_name = self.turn_order[self.current_turn_index]
+            if not self.player_by_name[next_name].eliminated:
+                self.current_turn = next_name
+                break
+
         self.phase = "ROLL"
         self.dice_result = (0, 0)
         self.steps = 0
         self.reachable = set()
         self.reachable_rooms = set()
-        print(f"It is now {self.current_turn}'s turn.")
+        self.modal_state = None
+        self.has_suggested_this_turn = False
+        self._schedule_ai_turn()
+        self._prepare_private_view()
+        self.log_message(f"It is now {self.current_turn}'s turn.")
 
-    # ------------------------------------------------------------------
-    # MOVEMENT SYSTEM
-    # ------------------------------------------------------------------
+    # Movement system
 
     def _build_door_room_map(self):
-        """Map each DOOR cell to the set of room types it is adjacent to."""
+        """Work out which rooms each door connects to."""
         door_map = {}
         directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
         for gy in range(self.grid_height):
@@ -137,25 +448,120 @@ class CluedoGame:
                 door_map[(gx, gy)] = connected
         return door_map
 
-    def _build_room_anchor_map(self):
-        """Pick one stable tile per room type for teleports (e.g., secret passages)."""
-        anchors = {}
+    def _build_room_slot_map(self):
+        """Pick a handful of sensible spots inside each room for players and weapons."""
+        room_cells = {}
         for gy in range(self.grid_height):
             for gx in range(self.grid_width):
                 cell = self.grid[gy][gx]
-                if cell["is_room"] and cell["type"] not in anchors:
-                    anchors[cell["type"]] = (gx, gy)
-        return anchors
+                if cell["is_room"]:
+                    room_cells.setdefault(cell["type"], []).append((gx, gy))
+
+        slot_map = {}
+        for room_name, cells in room_cells.items():
+            center_x = sum(gx for gx, _ in cells) / len(cells)
+            center_y = sum(gy for _, gy in cells) / len(cells)
+            ranked = sorted(
+                cells,
+                key=lambda pos: (
+                    abs(pos[0] - center_x) + abs(pos[1] - center_y),
+                    abs(pos[0] - center_x),
+                    abs(pos[1] - center_y),
+                ),
+            )
+
+            chosen = []
+            for cell in ranked:
+                if all(abs(cell[0] - sx) + abs(cell[1] - sy) >= 2 for sx, sy in chosen):
+                    chosen.append(cell)
+                if len(chosen) >= 8:
+                    break
+
+            for cell in ranked:
+                if len(chosen) >= 8:
+                    break
+                if cell not in chosen:
+                    chosen.append(cell)
+
+            slot_map[room_name] = chosen or ranked[:1]
+
+        return slot_map
+
+    def _build_room_anchor_map(self):
+        """Keep one default fallback spot per room."""
+        return {room_name: slots[0] for room_name, slots in self.room_slots_by_type.items()}
+
+    def _get_available_room_slot(self, room_name, moving_name=None):
+        slots = self.room_slots_by_type.get(room_name, [self.room_anchor_by_type.get(room_name)])
+        occupied = set()
+        for name, data in self.characters.items():
+            if name == moving_name:
+                continue
+            gx, gy = data["position"]
+            cell = self.grid[gy][gx]
+            if cell["is_room"] and cell["type"] == room_name:
+                occupied.add((gx, gy))
+
+        for slot in slots:
+            if slot not in occupied:
+                return slot
+        return slots[0]
+
+    def _place_character_in_room(self, character_name, room_name):
+        if character_name in self.characters and room_name in self.room_anchor_by_type:
+            self.characters[character_name]["position"] = self._get_available_room_slot(room_name, moving_name=character_name)
+
+    def _place_spare_characters(self):
+        spare_names = [name for name in CHARACTER_ORDER if name not in self.active_character_names]
+        spare_rooms = ROOMS[:]
+        random.shuffle(spare_rooms)
+
+        for index, name in enumerate(spare_names):
+            room_name = spare_rooms[index % len(spare_rooms)]
+            self._place_character_in_room(name, room_name)
+
+    def _setup_weapon_tokens(self):
+        available_rooms = ROOMS[:]
+        random.shuffle(available_rooms)
+        self.weapon_locations = {
+            weapon: room_name for weapon, room_name in zip(WEAPONS, available_rooms)
+        }
+
+    def _move_suggestion_tokens(self, suspect_name, weapon_name, room_name):
+        self._move_suspect_into_room(suspect_name, room_name)
+        self.weapon_locations[weapon_name] = room_name
+
+    def _draw_weapons(self, y_off):
+        for room_name in ROOMS:
+            weapons_here = [weapon for weapon in WEAPONS if self.weapon_locations.get(weapon) == room_name]
+            if not weapons_here:
+                continue
+
+            slots = list(reversed(self.room_slots_by_type.get(room_name, [self.room_anchor_by_type.get(room_name)])))
+            for idx, weapon_name in enumerate(weapons_here):
+                slot = slots[idx % len(slots)]
+                center = (
+                    slot[0] * CELL_SIZE + CELL_SIZE // 2,
+                    slot[1] * CELL_SIZE + CELL_SIZE // 2 + y_off,
+                )
+                color = WEAPON_TOKEN_COLORS.get(weapon_name, (220, 220, 220))
+                pygame.draw.circle(self.screen, color, center, 7)
+                pygame.draw.circle(self.screen, (20, 20, 20), center, 7, 1)
+
+                label = WEAPON_TOKEN_LABELS.get(weapon_name, weapon_name[:2])
+                text = self.tiny_font.render(label, True, (20, 20, 20))
+                self.screen.blit(text, (center[0] - text.get_width() // 2, center[1] - text.get_height() // 2))
 
     def _is_occupied_by_other(self, gx, gy):
-        """True if another player occupies this walkable tile."""
-        for name, data in self.characters.items():
+        """True if another active player occupies this walkable tile."""
+        for name in self.active_character_names:
+            data = self.characters[name]
             if name != self.current_turn and data["position"] == (gx, gy):
                 return True
         return False
 
     def _current_door_rooms(self):
-        """Rooms that can be entered right now from the current tile."""
+        """Return the rooms you can step into from the tile you're on."""
         gx, gy = self.characters[self.current_turn]["position"]
         if self.steps < 1:
             return set()
@@ -164,7 +570,7 @@ class CluedoGame:
         return set(self.door_to_rooms.get((gx, gy), set()))
 
     def _current_secret_passage_destination(self):
-        """Return the passage destination room for the current player, if available."""
+        """Return the linked room if the player is standing in a passage room."""
         gx, gy = self.characters[self.current_turn]["position"]
         current_cell = self.grid[gy][gx]
         if not current_cell["is_room"]:
@@ -172,13 +578,13 @@ class CluedoGame:
         return SECRET_PASSAGES.get(current_cell["type"])
 
     def _shortest_walk_distance(self, start, goal, max_steps):
-        """Shortest distance bounded by max_steps, including the first step out of a room."""
+        """Find the shortest walk distance, including the first step out of a room."""
         if start == goal:
             return 0
 
         occupied = {
-            data["position"]
-            for name, data in self.characters.items()
+            self.characters[name]["position"]
+            for name in self.active_character_names
             if name != self.current_turn
         }
 
@@ -230,6 +636,169 @@ class CluedoGame:
 
         return None
 
+    def _open_suggestion_dialog(self, room_name=None):
+        room_name = room_name or self._current_room_name()
+        if not room_name:
+            self.log_message("You need to be inside a room to make a suggestion.")
+            return
+        if self.has_suggested_this_turn:
+            self.log_message("You can only make one suggestion per turn.")
+            return
+
+        self.modal_state = {
+            "type": "suggestion",
+            "field": 0,
+            "room": room_name,
+            "suspect_index": 0,
+            "weapon_index": 0,
+        }
+
+    def _open_accusation_dialog(self):
+        if not self._can_accuse_now():
+            self.log_message("You can only accuse right after making a suggestion.")
+            return
+
+        self.modal_state = {
+            "type": "accusation",
+            "field": 0,
+            "suspect_index": 0,
+            "weapon_index": 0,
+            "room_index": 0,
+        }
+
+    def _move_suspect_into_room(self, suspect_name, room_name):
+        self._place_character_in_room(suspect_name, room_name)
+
+    def _submit_suggestion(self):
+        if not self.modal_state or self.modal_state["type"] != "suggestion":
+            return
+
+        player = self._current_player()
+        room_name = self.modal_state["room"]
+        suspect = SUSPECTS[self.modal_state["suspect_index"]]
+        weapon = WEAPONS[self.modal_state["weapon_index"]]
+
+        self._move_suggestion_tokens(suspect, weapon, room_name)
+        make_suggestion(
+            player,
+            suspect,
+            weapon,
+            room_name,
+            self._players_from_current_turn(),
+            logger=self.log_message,
+        )
+        self.has_suggested_this_turn = True
+        self.modal_state = None
+        self.phase = "ACTION"
+        self.log_message("Press A to accuse or S to end your turn.")
+
+    def _submit_accusation(self):
+        if not self.modal_state or self.modal_state["type"] != "accusation":
+            return
+
+        player = self._current_player()
+        suspect = SUSPECTS[self.modal_state["suspect_index"]]
+        weapon = WEAPONS[self.modal_state["weapon_index"]]
+        room_name = ROOMS[self.modal_state["room_index"]]
+
+        won = make_accusation(player, suspect, weapon, room_name, self.envelope, logger=self.log_message)
+        self.modal_state = None
+
+        if won:
+            self.game_over = True
+            self.winner = player
+            self.log_message(
+                f"Solution: {self.envelope.suspect.name} | {self.envelope.weapon.name} | {self.envelope.room.name}"
+            )
+            return
+
+        self.next_turn()
+
+    def _pick_ai_room(self, player, reachable_rooms):
+        unknown_rooms = [
+            entry.card.name
+            for entry in player.checklist
+            if entry.card.category == "room" and not entry.marked
+        ]
+        preferred = [room for room in reachable_rooms if room in unknown_rooms]
+        return random.choice(preferred or list(reachable_rooms))
+
+    def _run_ai_turn(self):
+        if self.game_over:
+            return
+
+        player = self._current_player()
+        if player.eliminated:
+            self.next_turn()
+            return
+
+        room_name = self._current_room_name(player.name)
+        if room_name:
+            won = ai_turn(
+                player,
+                self._players_from_current_turn(),
+                self.envelope,
+                current_room=room_name,
+                logger=self.log_message,
+                on_suggestion=self._move_suggestion_tokens,
+            )
+            self.has_suggested_this_turn = True
+            if won:
+                self.game_over = True
+                self.winner = player
+                self.log_message(
+                    f"Solution: {self.envelope.suspect.name} | {self.envelope.weapon.name} | {self.envelope.room.name}"
+                )
+                return
+            self.next_turn()
+            return
+
+        self.roll_dice()
+        gx, gy = self.characters[self.current_turn]["position"]
+        reachable, reachable_rooms = self._compute_reachable(gx, gy, self.steps)
+
+        if reachable_rooms:
+            chosen_room = self._pick_ai_room(player, reachable_rooms)
+            destination = self.room_anchor_by_type.get(chosen_room)
+            if destination:
+                self.characters[self.current_turn]["position"] = destination
+                self.phase = "ACTION"
+                self.steps = 0
+                self.reachable = set()
+                self.reachable_rooms = set()
+                self.log_message(f"{player.name} entered {chosen_room}.")
+                won = ai_turn(
+                    player,
+                    self._players_from_current_turn(),
+                    self.envelope,
+                    current_room=chosen_room,
+                    logger=self.log_message,
+                    on_suggestion=self._move_suggestion_tokens,
+                )
+                self.has_suggested_this_turn = True
+                if won:
+                    self.game_over = True
+                    self.winner = player
+                    self.log_message(
+                        f"Solution: {self.envelope.suspect.name} | {self.envelope.weapon.name} | {self.envelope.room.name}"
+                    )
+                    return
+                self.next_turn()
+                return
+
+        if reachable:
+            door_targets = [pos for pos in reachable if self.grid[pos[1]][pos[0]]["type"] == "DOOR"]
+            target = random.choice(door_targets or list(reachable))
+            distance = self._shortest_walk_distance((gx, gy), target, self.steps) or 0
+            self.characters[self.current_turn]["position"] = target
+            self.steps = max(self.steps - distance, 0)
+            cell_type = self.grid[target[1]][target[0]]["type"]
+            self.log_message(f"{player.name} moved to ({target[0]},{target[1]}) [{cell_type}].")
+        else:
+            self.log_message(f"{player.name} could not move this turn.")
+
+        self.next_turn()
+
     def roll_dice(self):
         """Roll two dice, compute reachable cells, and enter MOVE phase."""
         if self.phase != "ROLL":
@@ -241,17 +810,16 @@ class CluedoGame:
         self.reachable, _ = self._compute_reachable(gx, gy, self.steps)
         self.reachable_rooms = self._current_door_rooms()
         self.phase = "MOVE"
-        print(f"{self.current_turn} rolled {d1} + {d2} = {self.steps}")
+        self.log_message(f"{self.current_turn} rolled {d1} + {d2} = {self.steps}")
 
     def _compute_reachable(self, start_gx, start_gy, steps):
         """
-        BFS that finds every walkable tile reachable in up to `steps` moves and
-        every room reachable by entering through an adjacent door.
-        Returns (reachable_cells: set, reachable_rooms: set).
+        Work out which hallway tiles and rooms can still be reached with the roll.
+        Returns (reachable_cells, reachable_rooms).
         """
         occupied = {
-            data["position"]
-            for name, data in self.characters.items()
+            self.characters[name]["position"]
+            for name in self.active_character_names
             if name != self.current_turn
         }
 
@@ -264,7 +832,7 @@ class CluedoGame:
         start_cell = self.grid[start_gy][start_gx]
 
         if start_cell["is_room"]:
-            # Player is inside a room — seed BFS from every exit door
+            # If the player starts in a room, begin from its doors.
             room_type = start_cell["type"]
             for (dgx, dgy), rooms in self.door_to_rooms.items():
                 if room_type in rooms and steps >= 1 and (dgx, dgy) not in occupied:
@@ -274,20 +842,20 @@ class CluedoGame:
                         queue.append((dgx, dgy, rem))
                         reachable.add((dgx, dgy))
         else:
-            # Player is on a hallway / door / start tile
+            # Otherwise just start from the tile they're already on.
             visited[(start_gx, start_gy)] = steps
             queue.append((start_gx, start_gy, steps))
 
         while queue:
             gx, gy, remaining = queue.popleft()
 
-            # Discard stale entries
+            # Skip old queue entries.
             if visited.get((gx, gy), -1) > remaining:
                 continue
 
             cell = self.grid[gy][gx]
 
-            # From a door tile with at least 1 move left, rooms can be entered.
+            # If you're on a door with moves left, you can enter its room.
             if cell["type"] == "DOOR" and remaining >= 1:
                 for room_type in self.door_to_rooms.get((gx, gy), set()):
                     reachable_rooms.add(room_type)
@@ -295,7 +863,7 @@ class CluedoGame:
             if remaining == 0:
                 continue
 
-            # Expand to adjacent walkable tiles
+            # Try the next walkable tiles.
             for dx, dy in directions:
                 nx, ny = gx + dx, gy + dy
                 if not (0 <= nx < self.grid_width and 0 <= ny < self.grid_height):
@@ -314,45 +882,49 @@ class CluedoGame:
         return reachable, reachable_rooms
 
     def skip_move(self):
-        """Player stays stationary this turn (rule 15)."""
-        if self.phase not in ["ROLL", "MOVE"]:
+        """End the turn without moving any further."""
+        if self.phase not in ["ROLL", "MOVE", "ACTION"]:
             return
-        print(f"{self.current_turn} stays put.")
+        self.log_message(f"{self.current_turn} ends their turn.")
         self.next_turn()
 
     def use_secret_passage(self):
-        """Use a secret passage if the current player is in a corner room that has one."""
+        """Use a secret passage from one of the corner rooms."""
         if self.phase not in ["ROLL", "MOVE"]:
+            self.log_message("Use the secret passage before ending your turn.")
             return
 
         gx, gy = self.characters[self.current_turn]["position"]
         current_cell = self.grid[gy][gx]
         if not current_cell["is_room"]:
-            print("You must be inside Study, Kitchen, Lounge, or Conservatory to use a secret passage.")
+            self.log_message("You must be inside Study, Kitchen, Lounge, or Conservatory to use a secret passage.")
             return
 
         source_room = current_cell["type"]
         destination_room = self._current_secret_passage_destination()
         if not destination_room:
-            print("This room has no secret passage.")
+            self.log_message("This room has no secret passage.")
             return
 
-        destination_pos = self.room_anchor_by_type.get(destination_room)
+        destination_pos = self._get_available_room_slot(destination_room, moving_name=self.current_turn)
         if not destination_pos:
-            print(f"Could not find destination room tile for {destination_room}.")
+            self.log_message(f"Could not find destination room tile for {destination_room}.")
             return
 
         self.characters[self.current_turn]["position"] = destination_pos
         self.reachable = set()
         self.reachable_rooms = set()
         self.steps = 0
-        print(f"{self.current_turn} used secret passage: {source_room} -> {destination_room}")
+        self.log_message(f"{self.current_turn} used secret passage: {source_room} -> {destination_room}")
         self.next_turn()
 
     def handle_move(self, target_gx, target_gy):
-        """Validate and execute movement while preserving remaining steps."""
+        """Check the move, then apply it if it's valid."""
         if self.phase != "MOVE":
-            print("Roll the dice first! (Press SPACE)")
+            if self.phase == "ACTION":
+                self.log_message("Use J to suggest, A to accuse, or S to end your turn.")
+            else:
+                self.log_message("Roll the dice first! (Press SPACE)")
             return
 
         if not (0 <= target_gx < self.grid_width and 0 <= target_gy < self.grid_height):
@@ -363,70 +935,426 @@ class CluedoGame:
         current_cell = self.grid[current_gy][current_gx]
         target_cell = self.grid[target_gy][target_gx]
 
-        # Room entry: must currently be standing on the specific door.
+        # To enter a room, the player has to be standing on the right door.
         if target_cell["is_room"]:
             if self.steps < 1:
-                print("No movement left to enter a room.")
+                self.log_message("No movement left to enter a room.")
                 return
             if current_cell["type"] != "DOOR":
-                print("You must stand on a door tile before entering a room.")
+                self.log_message("You must stand on a door tile before entering a room.")
                 return
             connected_rooms = self.door_to_rooms.get((current_gx, current_gy), set())
             if target_cell["type"] not in connected_rooms:
-                print(f"This door does not lead to {target_cell['type']}!")
+                self.log_message(f"This door does not lead to {target_cell['type']}!")
                 return
 
-            # Entering a room ends movement for the turn (rule 14).
-            char["position"] = (target_gx, target_gy)
-            print(f"Moved {self.current_turn} into {target_cell['type']}")
-            self.next_turn()
+            destination = self._get_available_room_slot(target_cell["type"], moving_name=self.current_turn)
+            char["position"] = destination or (target_gx, target_gy)
+            self.steps = 0
+            self.reachable = set()
+            self.reachable_rooms = set()
+            self.phase = "ACTION"
+            self.log_message(f"Moved {self.current_turn} into {target_cell['type']}")
+            if self._current_player().is_human:
+                self._open_suggestion_dialog(target_cell["type"])
             return
 
-        # Standard hallway movement.
+        # Normal hallway movement.
         if not target_cell["walkable"]:
-            print("That tile is not walkable.")
+            self.log_message("That tile is not walkable.")
             return
         if self._is_occupied_by_other(target_gx, target_gy):
-            print("That square is occupied.")
+            self.log_message("That square is occupied.")
             return
         if (target_gx, target_gy) not in self.reachable:
-            print("Target is out of range for your remaining movement.")
+            self.log_message("Target is out of range for your remaining movement.")
             return
 
         distance = self._shortest_walk_distance((current_gx, current_gy), (target_gx, target_gy), self.steps)
         if distance is None:
-            print("No valid path to that tile.")
+            self.log_message("No valid path to that tile.")
             return
 
         char["position"] = (target_gx, target_gy)
         self.steps -= distance
-        print(f"Moved {self.current_turn} to ({target_gx},{target_gy}) [{target_cell['type']}], {self.steps} step(s) left")
+        self.log_message(f"{self.current_turn} moved {distance} step(s).")
 
         if self.steps <= 0:
-            self.next_turn()
+            self.reachable = set()
+            self.reachable_rooms = set()
+            self.phase = "ACTION"
+            if self._current_room_name():
+                self._open_suggestion_dialog(self._current_room_name())
+            else:
+                self.log_message("Use J to suggest, A to accuse, or S to end your turn.")
             return
 
-        # Keep turn active with updated movement budget.
-        self.reachable, _ = self._compute_reachable(target_gx, target_gy, self.steps)
-        self.reachable_rooms = self._current_door_rooms()
+        next_gx, next_gy = char["position"]
+        self.reachable, self.reachable_rooms = self._compute_reachable(next_gx, next_gy, self.steps)
 
-        # If standing on a door after moving, show room-entry options for the next click.
-        self.reachable_rooms = self._current_door_rooms()
+    def _draw_event_log_panel(self, log_rect, accent_color):
+        pygame.draw.rect(self.screen, (22, 22, 22), log_rect, border_radius=6)
+        pygame.draw.rect(self.screen, PANEL_ACCENT, log_rect, 1, border_radius=6)
+        self.screen.blit(self.small_font.render("Event Log", True, accent_color), (log_rect.x + 8, log_rect.y + 6))
+
+        if not self.message_log:
+            self.screen.blit(self.tiny_font.render("No key events yet.", True, MUTED_TEXT), (log_rect.x + 8, log_rect.y + 28))
+            return
+
+        wrap_width = max(18, (log_rect.width - 24) // 7)
+        rendered_entries = []
+        for entry in self.message_log[-8:]:
+            if isinstance(entry, dict):
+                label = entry.get("label", "Info")
+                text = entry.get("text", "")
+                color = entry.get("color", TEXT_COLOR)
+            else:
+                label, text, color = "Info", str(entry), TEXT_COLOR
+            rendered_entries.append((label, textwrap.wrap(text, width=wrap_width) or [text], color))
+
+        max_lines = max(1, (log_rect.height - 34) // 14)
+        selected = []
+        used = 0
+        for label, lines, color in reversed(rendered_entries):
+            needed = 1 + len(lines) + 1
+            if selected and used + needed > max_lines:
+                break
+            selected.append((label, lines, color))
+            used += needed
+
+        y = log_rect.y + 28
+        for label, lines, color in reversed(selected):
+            self.screen.blit(self.tiny_font.render(label, True, color), (log_rect.x + 8, y))
+            y += 14
+            for line in lines:
+                self.screen.blit(self.tiny_font.render(line, True, TEXT_COLOR), (log_rect.x + 12, y))
+                y += 13
+            y += 4
+
+    def _draw_private_info_panel(self, current_player, left_x, y, panel_height, accent_color):
+        if self.awaiting_turn_handoff and current_player.is_human:
+            handoff_lines = [
+                f"Pass to {current_player.name}.",
+                "Press Enter when they are ready.",
+                "Private info stays hidden until V is pressed.",
+            ]
+            for line in handoff_lines:
+                for wrapped in textwrap.wrap(line, width=40):
+                    self.screen.blit(self.small_font.render(wrapped, True, TEXT_COLOR), (left_x, y))
+                    y += 18
+            return
+
+        if not current_player.is_human:
+            self.screen.blit(self.small_font.render("AI turn in progress.", True, TEXT_COLOR), (left_x, y))
+            y += 20
+            self.screen.blit(self.tiny_font.render("Private notes stay hidden on AI turns.", True, MUTED_TEXT), (left_x, y))
+            return
+
+        if not self.private_info_visible:
+            hidden_lines = [
+                "Private info is hidden.",
+                "Press V to reveal this player's hand and notes.",
+            ]
+            for line in hidden_lines:
+                for wrapped in textwrap.wrap(line, width=40):
+                    self.screen.blit(self.small_font.render(wrapped, True, TEXT_COLOR), (left_x, y))
+                    y += 18
+            return
+
+        viewer = current_player
+        self.screen.blit(self.small_font.render(f"{viewer.name}'s Hand", True, accent_color), (left_x, y))
+        y += 18
+        for card in viewer.hand:
+            self.screen.blit(self.tiny_font.render(f"- {card.name}", True, TEXT_COLOR), (left_x + 4, y))
+            y += 14
+
+        y += 6
+        self.screen.blit(self.small_font.render("Detective Notes", True, accent_color), (left_x, y))
+        y += 18
+
+        notes_top = y
+        notes_bottom = panel_height - 18
+        available_note_lines = max(1, (notes_bottom - notes_top - 10) // 13)
+        note_lines = []
+        for category in ("suspect", "weapon", "room"):
+            note_lines.append((category.title() + "s", MUTED_TEXT, 0))
+            for entry in viewer.checklist:
+                if entry.card.category != category:
+                    continue
+                status = "x" if entry.marked else " "
+                note = f" - {entry.note}" if entry.note else ""
+                line = f"[{status}] {entry.card.name}{note}"
+                for wrapped in textwrap.wrap(line, width=36):
+                    note_lines.append((wrapped, TEXT_COLOR, 6))
+
+        max_offset = max(0, len(note_lines) - available_note_lines)
+        self.note_scroll_offset = max(0, min(self.note_scroll_offset, max_offset))
+        visible_lines = note_lines[self.note_scroll_offset:self.note_scroll_offset + available_note_lines]
+
+        for text, color, indent in visible_lines:
+            self.screen.blit(self.tiny_font.render(text, True, color), (left_x + indent, y))
+            y += 13
+
+        if max_offset > 0:
+            scroll_hint = f"Notes scroll: {self.note_scroll_offset + 1}-{self.note_scroll_offset + len(visible_lines)} / {len(note_lines)}"
+            self.screen.blit(self.tiny_font.render(scroll_hint, True, MUTED_TEXT), (left_x, notes_bottom - 12))
+
+    def _draw_side_panel(self):
+        panel_x = self.board_width
+        panel_height = self.board_height + UI_BAR_HEIGHT
+        pygame.draw.rect(self.screen, PANEL_BG, (panel_x, 0, SIDE_PANEL_WIDTH, panel_height))
+        pygame.draw.line(self.screen, PANEL_ACCENT, (panel_x, 0), (panel_x, panel_height), 2)
+
+        y = 10
+        accent_color = (255, 215, 0)
+
+        header = self.font.render("Gameplay Panel", True, accent_color)
+        self.screen.blit(header, (panel_x + 12, y))
+        y += 26
+
+        if not self.players:
+            self.screen.blit(self.small_font.render("Set up the players to begin.", True, TEXT_COLOR), (panel_x + 12, y))
+            return
+
+        current_player = self._current_player()
+        info_lines = [
+            f"Current: {current_player.name}",
+            f"Role: {'Human' if current_player.is_human else 'AI'}",
+            f"Phase: {self.phase}",
+            f"Room: {self._current_room_name() or 'Hallway'}",
+        ]
+        for line in info_lines:
+            self.screen.blit(self.small_font.render(line, True, TEXT_COLOR), (panel_x + 12, y))
+            y += 18
+
+        y += 4
+        self.screen.blit(self.small_font.render("Controls", True, accent_color), (panel_x + 12, y))
+        y += 18
+        controls = [
+            "SPACE roll   S end turn",
+            "J suggest    A accuse",
+            "P passage    V private info",
+            "G/R overlays H help guide",
+        ]
+        for line in controls:
+            self.screen.blit(self.tiny_font.render(line, True, MUTED_TEXT), (panel_x + 12, y))
+            y += 16
+
+        left_x = panel_x + 12
+        column_top = y + 6
+        log_height = 180
+        log_rect = pygame.Rect(panel_x + 12, panel_height - log_height - 10, SIDE_PANEL_WIDTH - 24, log_height)
+
+        self._draw_event_log_panel(log_rect, accent_color)
+        self._draw_private_info_panel(current_player, left_x, column_top, log_rect.y - 4, accent_color)
+
+    def _draw_modal(self):
+        if not self.modal_state:
+            return
+
+        overlay = pygame.Surface((self.screen.get_width(), self.screen.get_height()), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 150))
+        self.screen.blit(overlay, (0, 0))
+
+        box_w = 430
+        box_h = 220 if self.modal_state["type"] == "accusation" else 190
+        box_x = (self.board_width - box_w) // 2
+        box_y = UI_BAR_HEIGHT + (self.board_height - box_h) // 2
+        box_rect = pygame.Rect(box_x, box_y, box_w, box_h)
+        pygame.draw.rect(self.screen, (36, 36, 36), box_rect)
+        pygame.draw.rect(self.screen, (210, 210, 210), box_rect, 2)
+
+        title = "Make a Suggestion" if self.modal_state["type"] == "suggestion" else "Make an Accusation"
+        self.screen.blit(self.font.render(title, True, (255, 215, 0)), (box_x + 16, box_y + 14))
+        self.screen.blit(
+            self.tiny_font.render("Use arrow keys, Enter to confirm, Esc to cancel", True, TEXT_COLOR),
+            (box_x + 16, box_y + 42),
+        )
+
+        lines = []
+        if self.modal_state["type"] == "suggestion":
+            lines = [
+                ("Suspect", SUSPECTS[self.modal_state["suspect_index"]]),
+                ("Weapon", WEAPONS[self.modal_state["weapon_index"]]),
+                ("Room", self.modal_state["room"] + " (current room)"),
+            ]
+        else:
+            lines = [
+                ("Suspect", SUSPECTS[self.modal_state["suspect_index"]]),
+                ("Weapon", WEAPONS[self.modal_state["weapon_index"]]),
+                ("Room", ROOMS[self.modal_state["room_index"]]),
+            ]
+
+        y = box_y + 78
+        selectable_fields = 2 if self.modal_state["type"] == "suggestion" else 3
+        for idx, (label, value) in enumerate(lines):
+            is_selected = idx == self.modal_state["field"] and idx < selectable_fields
+            color = (120, 220, 255) if is_selected else TEXT_COLOR
+            prefix = "> " if is_selected else "  "
+            text = self.small_font.render(f"{prefix}{label}: {value}", True, color)
+            self.screen.blit(text, (box_x + 20, y))
+            y += 28
+
+    def _draw_menu_overlay(self):
+        overlay = pygame.Surface((self.screen.get_width(), self.screen.get_height()), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        self.screen.blit(overlay, (0, 0))
+
+        box_w = 560
+        box_h = 320
+        box_x = (self.board_width - box_w) // 2
+        box_y = UI_BAR_HEIGHT + 28
+        box_rect = pygame.Rect(box_x, box_y, box_w, box_h)
+        pygame.draw.rect(self.screen, (34, 34, 34), box_rect)
+        pygame.draw.rect(self.screen, (210, 210, 210), box_rect, 2)
+
+        self.screen.blit(self.font.render("Cluedo Setup", True, (255, 215, 0)), (box_x + 16, box_y + 14))
+        self.screen.blit(
+            self.tiny_font.render("Up/Down: select  Left/Right: change  Enter: start  Esc: quit", True, TEXT_COLOR),
+            (box_x + 16, box_y + 42),
+        )
+
+        lines = [("Player count", str(self.menu_player_count))]
+        for name in CHARACTER_ORDER[:self.menu_player_count]:
+            role = "Human" if self.menu_human_flags.get(name, True) else "AI"
+            lines.append((name, role))
+        lines.append(("Start Game", ""))
+
+        y = box_y + 78
+        for idx, (label, value) in enumerate(lines):
+            is_selected = idx == self.menu_cursor
+            color = (120, 220, 255) if is_selected else TEXT_COLOR
+            prefix = "> " if is_selected else "  "
+            line = f"{prefix}{label}: {value}" if value else f"{prefix}{label}"
+            self.screen.blit(self.small_font.render(line, True, color), (box_x + 20, y))
+            y += 28
+
+        selected_names = CHARACTER_ORDER[:self.menu_player_count]
+        humans = [name for name in selected_names if self.menu_human_flags.get(name, True)]
+        ai_players = [name for name in selected_names if not self.menu_human_flags.get(name, True)]
+        summary = [
+            f"Humans: {', '.join(humans) if humans else 'none'}",
+            f"AI players: {', '.join(ai_players) if ai_players else 'none'}",
+            "Tip: choose all AI for a simulation or all human for pass-and-play testing.",
+        ]
+
+        y += 8
+        for line in summary:
+            for wrapped in textwrap.wrap(line, width=66):
+                self.screen.blit(self.tiny_font.render(wrapped, True, MUTED_TEXT), (box_x + 20, y))
+                y += 18
+
+    def _draw_handoff_overlay(self):
+        if not self.awaiting_turn_handoff or not self.players or self.game_over:
+            return
+
+        current_player = self._current_player()
+        if not current_player.is_human:
+            return
+
+        overlay = pygame.Surface((self.screen.get_width(), self.screen.get_height()), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 185))
+        self.screen.blit(overlay, (0, 0))
+
+        box_w = 460
+        box_h = 180
+        box_x = (self.board_width - box_w) // 2
+        box_y = UI_BAR_HEIGHT + (self.board_height - box_h) // 2
+        box_rect = pygame.Rect(box_x, box_y, box_w, box_h)
+        pygame.draw.rect(self.screen, (34, 34, 34), box_rect)
+        pygame.draw.rect(self.screen, (210, 210, 210), box_rect, 2)
+
+        lines = [
+            f"Pass to {current_player.name}",
+            "Make sure the other players are not looking.",
+            "Press Enter when ready to start the turn.",
+        ]
+
+        y = box_y + 20
+        for idx, line in enumerate(lines):
+            font = self.font if idx == 0 else self.small_font
+            color = (255, 215, 0) if idx == 0 else TEXT_COLOR
+            text = font.render(line, True, color)
+            x = box_x + (box_w - text.get_width()) // 2
+            self.screen.blit(text, (x, y))
+            y += 38 if idx == 0 else 28
+
+    def _draw_help_overlay(self):
+        if not self.show_help_overlay:
+            return
+
+        overlay = pygame.Surface((self.screen.get_width(), self.screen.get_height()), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 165))
+        self.screen.blit(overlay, (0, 0))
+
+        box_w = 560
+        box_h = 270
+        box_x = (self.board_width - box_w) // 2
+        box_y = UI_BAR_HEIGHT + 28
+        box_rect = pygame.Rect(box_x, box_y, box_w, box_h)
+        pygame.draw.rect(self.screen, (34, 34, 34), box_rect)
+        pygame.draw.rect(self.screen, (210, 210, 210), box_rect, 2)
+
+        self.screen.blit(self.font.render("How to Play", True, (255, 215, 0)), (box_x + 16, box_y + 14))
+        guide_lines = [
+            "Goal: work out the suspect, weapon, and room hidden in the envelope.",
+            "1. At the start of a human turn, pass the device over and press Enter.",
+            "2. Press V to reveal or hide that player's hand and detective notes.",
+            "3. Press SPACE to roll, then click a green tile to move around the board.",
+            "4. Use door tiles to enter rooms. P uses a secret passage in corner rooms.",
+            "5. Press J to make a suggestion and A only when you're ready to accuse.",
+            "6. Press S to end the turn whenever you are finished.",
+            "Press H to hide/show this guide.",
+        ]
+
+        y = box_y + 50
+        for line in guide_lines:
+            for wrapped in textwrap.wrap(line, width=70):
+                self.screen.blit(self.small_font.render(wrapped, True, TEXT_COLOR), (box_x + 16, y))
+                y += 22
+
+    def _draw_game_over_overlay(self):
+        if not self.game_over:
+            return
+
+        overlay = pygame.Surface((self.screen.get_width(), self.screen.get_height()), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 170))
+        self.screen.blit(overlay, (0, 0))
+
+        solution = f"Solution: {self.envelope.suspect.name} | {self.envelope.weapon.name} | {self.envelope.room.name}"
+        winner_text = self.winner.name if self.winner else "No winner"
+        lines = [
+            "GAME OVER",
+            f"Winner: {winner_text}",
+            solution,
+            "Press Enter to play again, M for menu, or ESC to quit",
+        ]
+
+        start_y = self.screen.get_height() // 2 - 60
+        for idx, line in enumerate(lines):
+            font = self.font if idx == 0 else self.small_font
+            text = font.render(line, True, (255, 255, 255))
+            x = (self.screen.get_width() - text.get_width()) // 2
+            self.screen.blit(text, (x, start_y + idx * 28))
 
     def draw(self):
-        """Main rendering method."""
-        self.screen.fill((0, 0, 0)) # Clear screen
-        y_off = UI_BAR_HEIGHT # Offset for board drawing
-        
-        # Draw the physical board
+        """Draw the board and the current UI."""
+        self.screen.fill((0, 0, 0))
+        y_off = UI_BAR_HEIGHT
+
         self.screen.blit(self.board_image, (0, y_off))
 
-        # Draw reachable-cell highlights
+        if self.game_state == "MENU":
+            self._draw_menu_overlay()
+            return
+
+        self._draw_weapons(y_off)
+
         if self.reachable or self.reachable_rooms:
             tile_hl = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
-            tile_hl.fill((0, 220, 0, 80))     # green tint for walkable tiles
+            tile_hl.fill((0, 220, 0, 80))
             room_hl = pygame.Surface((CELL_SIZE, CELL_SIZE), pygame.SRCALPHA)
-            room_hl.fill((0, 220, 0, 55))     # lighter green for room areas
+            room_hl.fill((0, 220, 0, 55))
             for (gx, gy) in self.reachable:
                 self.screen.blit(tile_hl, (gx * CELL_SIZE, gy * CELL_SIZE + y_off))
             if self.reachable_rooms:
@@ -435,7 +1363,6 @@ class CluedoGame:
                         if self.grid[gy][gx]["type"] in self.reachable_rooms:
                             self.screen.blit(room_hl, (gx * CELL_SIZE, gy * CELL_SIZE + y_off))
 
-        # Draw Room Overlays (Toggleable)
         if self.show_rooms:
             for gy in range(self.grid_height):
                 for gx in range(self.grid_width):
@@ -447,68 +1374,183 @@ class CluedoGame:
                         s.fill(color)
                         self.screen.blit(s, (gx * CELL_SIZE, gy * CELL_SIZE + y_off))
 
-        # Draw Grid (Toggleable)
         if self.show_grid:
             for x in range(0, self.board_width, CELL_SIZE):
                 pygame.draw.line(self.screen, GRID_COLOR, (x, y_off), (x, self.board_height + y_off))
             for y in range(0, self.board_height + CELL_SIZE, CELL_SIZE):
                 pygame.draw.line(self.screen, GRID_COLOR, (0, y + y_off), (self.board_width, y + y_off))
 
-        # Draw Players
         for name, data in self.characters.items():
             gx, gy = data["position"]
             center = (gx * CELL_SIZE + CELL_SIZE // 2, gy * CELL_SIZE + CELL_SIZE // 2 + y_off)
-            
-            # Draw Token
-            pygame.draw.circle(self.screen, (0, 0, 0), center, (CELL_SIZE // 2) - 2) # Shadow/Border
+            pygame.draw.circle(self.screen, (0, 0, 0), center, (CELL_SIZE // 2) - 2)
             pygame.draw.circle(self.screen, data["color"], center, (CELL_SIZE // 2) - 4)
-            
-            # Highlight current player with a white ring
             if name == self.current_turn:
                 pygame.draw.circle(self.screen, (255, 255, 255), center, (CELL_SIZE // 2) - 1, 2)
 
         self.draw_ui()
+        self._draw_side_panel()
+        self._draw_modal()
+        self._draw_help_overlay()
+        self._draw_handoff_overlay()
+        self._draw_game_over_overlay()
 
     def draw_ui(self):
-        """Draws the top status bar: turn, dice, phase, and key hints."""
+        """Draw the top bar with turn info and controls."""
         font = pygame.font.SysFont("Arial", 16, bold=True)
         pygame.draw.rect(self.screen, (30, 30, 30), (0, 0, self.board_width, UI_BAR_HEIGHT))
         pygame.draw.line(self.screen, (80, 80, 80), (0, UI_BAR_HEIGHT), (self.board_width, UI_BAR_HEIGHT))
 
-        # Turn indicator
-        turn_label = font.render("Turn: ", True, (200, 200, 200))
-        name_text  = font.render(self.current_turn, True, self.characters[self.current_turn]["color"])
-        self.screen.blit(turn_label, (8, 7))
-        self.screen.blit(name_text,  (52, 7))
+        current_player = self._current_player()
+        room_name = self._current_room_name()
+        can_suggest = current_player.is_human and room_name and not self.has_suggested_this_turn
+        passage_hint = "  P: Passage" if current_player.is_human and self._current_secret_passage_destination() else ""
 
-        # Dice display
-        passage_hint = "   P: Passage" if self._current_secret_passage_destination() else ""
+        turn_label = font.render("Turn: ", True, (200, 200, 200))
+        role_suffix = " [AI]" if not current_player.is_human else ""
+        name_text = font.render(self.current_turn + role_suffix, True, self.characters[self.current_turn]["color"])
+        self.screen.blit(turn_label, (8, 7))
+        self.screen.blit(name_text, (52, 7))
+
+        can_accuse = current_player.is_human and self._can_accuse_now()
+
         if self.phase == "ROLL":
-            dice_text = font.render(f"  |  SPACE: Roll dice   S: Stay{passage_hint}", True, (180, 180, 60))
+            suggestion_hint = "  J: Suggest" if can_suggest else ""
+            dice_text = font.render(
+                f"| SPACE: Roll  S: End{suggestion_hint}{passage_hint}",
+                True,
+                (180, 180, 60),
+            )
+        elif self.phase == "ACTION":
+            action_bits = [f"| Room: {room_name}"]
+            if can_suggest:
+                action_bits.append("J: Suggest")
+            if can_accuse:
+                action_bits.append("A: Accuse")
+            action_bits.append("S: End")
+            dice_text = font.render(
+                "  ".join(action_bits),
+                True,
+                (120, 220, 255),
+            )
         else:
             d1, d2 = self.dice_result
             dice_text = font.render(
-                f"  |  Rolled: {d1}+{d2} | Steps left: {self.steps} | Click to move   S: Stay{passage_hint}",
-                True, (60, 220, 60)
+                f"| Rolled: {d1}+{d2} | Steps left: {self.steps} | Click to move  S: End{passage_hint}",
+                True,
+                (60, 220, 60),
             )
-        self.screen.blit(dice_text, (180, 7))
+        hint = self.tiny_font.render("G: Grid  R: Rooms  V: Private  H: Help  ESC: Quit", True, (120, 120, 120))
+        hint_x = self.board_width - hint.get_width() - 8
+        max_dice_width = max(80, hint_x - 190)
+        if dice_text.get_width() > max_dice_width:
+            cropped = dice_text.get_rect().copy()
+            cropped.width = max_dice_width
+            self.screen.blit(dice_text, (180, 7), cropped)
+        else:
+            self.screen.blit(dice_text, (180, 7))
 
-        # Right-hand controls hint
-        hint = font.render("G: Grid  R: Rooms  ESC: Quit", True, (120, 120, 120))
-        self.screen.blit(hint, (self.board_width - hint.get_width() - 8, 7))
+        self.screen.blit(hint, (hint_x, 7))
 
     def handle_input(self):
-        """Processes keyboard and mouse events."""
+        """Handle keyboard and mouse input."""
         for event in pygame.event.get():
-            if event.type == pygame.QUIT: 
+            if event.type == pygame.QUIT:
                 return False
-            
+
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                if self.modal_state:
+                    self.modal_state = None
+                    continue
+                return False
+
+            if self.game_state == "MENU":
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_UP:
+                        self.menu_cursor = (self.menu_cursor - 1) % (self.menu_player_count + 2)
+                    elif event.key == pygame.K_DOWN:
+                        self.menu_cursor = (self.menu_cursor + 1) % (self.menu_player_count + 2)
+                    elif event.key == pygame.K_LEFT and self.menu_cursor == 0:
+                        self.menu_player_count = max(2, self.menu_player_count - 1)
+                        self._sync_menu_selection()
+                    elif event.key == pygame.K_RIGHT and self.menu_cursor == 0:
+                        self.menu_player_count = min(len(CHARACTER_ORDER), self.menu_player_count + 1)
+                        self._sync_menu_selection()
+                    elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_SPACE, pygame.K_RETURN):
+                        if 1 <= self.menu_cursor <= self.menu_player_count:
+                            name = CHARACTER_ORDER[self.menu_cursor - 1]
+                            self.menu_human_flags[name] = not self.menu_human_flags.get(name, True)
+                        elif event.key == pygame.K_RETURN and self.menu_cursor == self.menu_player_count + 1:
+                            self._start_selected_game()
+                continue
+
+            if self.game_over:
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
+                    self._start_selected_game()
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_m:
+                    self._return_to_menu()
+                continue
+
+            if self.awaiting_turn_handoff:
+                if event.type == pygame.KEYDOWN:
+                    if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                        self.awaiting_turn_handoff = False
+                    elif event.key == pygame.K_h:
+                        self.show_help_overlay = not self.show_help_overlay
+                continue
+
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_g:
+                self.show_grid = not self.show_grid
+                continue
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                self.show_rooms = not self.show_rooms
+                continue
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_h:
+                self.show_help_overlay = not self.show_help_overlay
+                continue
+
+            if self.modal_state and event.type == pygame.KEYDOWN:
+                field_count = 2 if self.modal_state["type"] == "suggestion" else 3
+                if event.key == pygame.K_UP:
+                    self.modal_state["field"] = (self.modal_state["field"] - 1) % field_count
+                elif event.key == pygame.K_DOWN:
+                    self.modal_state["field"] = (self.modal_state["field"] + 1) % field_count
+                elif event.key == pygame.K_LEFT:
+                    if self.modal_state["field"] == 0:
+                        self.modal_state["suspect_index"] = (self.modal_state["suspect_index"] - 1) % len(SUSPECTS)
+                    elif self.modal_state["field"] == 1:
+                        self.modal_state["weapon_index"] = (self.modal_state["weapon_index"] - 1) % len(WEAPONS)
+                    elif self.modal_state["field"] == 2 and self.modal_state["type"] == "accusation":
+                        self.modal_state["room_index"] = (self.modal_state["room_index"] - 1) % len(ROOMS)
+                elif event.key == pygame.K_RIGHT:
+                    if self.modal_state["field"] == 0:
+                        self.modal_state["suspect_index"] = (self.modal_state["suspect_index"] + 1) % len(SUSPECTS)
+                    elif self.modal_state["field"] == 1:
+                        self.modal_state["weapon_index"] = (self.modal_state["weapon_index"] + 1) % len(WEAPONS)
+                    elif self.modal_state["field"] == 2 and self.modal_state["type"] == "accusation":
+                        self.modal_state["room_index"] = (self.modal_state["room_index"] + 1) % len(ROOMS)
+                elif event.key == pygame.K_RETURN:
+                    if self.modal_state["type"] == "suggestion":
+                        self._submit_suggestion()
+                    else:
+                        self._submit_accusation()
+                elif event.key == pygame.K_ESCAPE:
+                    self.modal_state = None
+                continue
+
+            current_player = self._current_player()
+            if not current_player.is_human:
+                continue
+
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = pygame.mouse.get_pos()
-                # Subtract UI height from mouse Y coordinate to align with grid
-                gx, gy = mx // CELL_SIZE, (my - UI_BAR_HEIGHT) // CELL_SIZE
-                self.handle_move(gx, gy)
-                
+                if mx < self.board_width and my >= UI_BAR_HEIGHT:
+                    gx, gy = mx // CELL_SIZE, (my - UI_BAR_HEIGHT) // CELL_SIZE
+                    self.handle_move(gx, gy)
+
+            if event.type == pygame.MOUSEWHEEL and self.private_info_visible:
+                self.note_scroll_offset = max(0, self.note_scroll_offset - event.y)
+
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
                     self.roll_dice()
@@ -516,20 +1558,31 @@ class CluedoGame:
                     self.skip_move()
                 elif event.key == pygame.K_p:
                     self.use_secret_passage()
-                elif event.key == pygame.K_g:
-                    self.show_grid = not self.show_grid
-                elif event.key == pygame.K_r:
-                    self.show_rooms = not self.show_rooms
-                elif event.key == pygame.K_ESCAPE:
-                    return False
+                elif event.key == pygame.K_j:
+                    self._open_suggestion_dialog()
+                elif event.key == pygame.K_a:
+                    self._open_accusation_dialog()
+                elif event.key == pygame.K_v:
+                    self.private_info_visible = not self.private_info_visible
+                    if self.private_info_visible:
+                        self.note_scroll_offset = 0
+                elif event.key == pygame.K_UP and self.private_info_visible:
+                    self.note_scroll_offset = max(0, self.note_scroll_offset - 1)
+                elif event.key == pygame.K_DOWN and self.private_info_visible:
+                    self.note_scroll_offset += 1
         return True
 
     def run(self):
-        """Game loop."""
+        """Main game loop."""
         clock = pygame.time.Clock()
         while True:
-            if not self.handle_input(): 
+            if not self.handle_input():
                 break
+            if self.pending_ai_turn and not self.modal_state and not self.game_over:
+                if pygame.time.get_ticks() >= self.ai_action_due_at:
+                    self.pending_ai_turn = False
+                    self.ai_action_due_at = 0
+                    self._run_ai_turn()
             self.draw()
             pygame.display.flip()
             clock.tick(60)
