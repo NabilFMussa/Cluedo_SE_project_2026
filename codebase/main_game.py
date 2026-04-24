@@ -1,9 +1,29 @@
+"""
+main_game.py
+
+Controls the overall game flow.
+
+Handles player setup, turn order, and running the main loop.
+Uses functions from the other files for game logic.
+"""
+
 import random
 from cluedo_card_setup import SUSPECTS, WEAPONS, ROOMS, setup_game
 from guess_cluedo import make_suggestion, make_accusation, ai_turn
 
 
 def pick(prompt, options):
+    """
+    Shows a numbered list of options and waits for the player to pick one.
+    Keeps asking until they enter a valid number.
+
+    Args:
+        prompt: the question to display above the list
+        options: list of strings to choose from
+
+    Returns:
+        The chosen string from the options list.
+    """
     print(f"\n{prompt}")
     for i, o in enumerate(options):
         print(f"  {i+1}. {o}")
@@ -15,6 +35,22 @@ def pick(prompt, options):
 
 
 def human_turn(human, all_players, envelope, label=None):
+    """
+    Runs an interactive turn for a human player.
+
+    Gives them a menu to suggest, accuse, view their checklist or skip.
+    If they pick suggestion or accusation, they then choose the suspect,
+    weapon and room from lists.
+
+    Args:
+        human: the Player whose turn it is
+        all_players: full list of players in the game
+        envelope: the Envelope holding the real solution
+        label: optional display name override e.g. "Player 2 - Col. Mustard"
+
+    Returns:
+        True if the player made a correct accusation and won, False otherwise.
+    """
     print(f"\n--- {label or human.name}'s turn ---")
 
     action = pick("What do you want to do?", [
@@ -50,6 +86,15 @@ def human_turn(human, all_players, envelope, label=None):
 
 
 def roll_for_order(players):
+    """
+    Rolls a dice (1-6) for each player and prints the results.
+
+    Args:
+        players: list of Player objects
+
+    Returns:
+        A dict mapping player name to their roll value.
+    """
     print("\nRolling to decide turn order...")
     rolls = {}
     for p in players:
@@ -59,6 +104,17 @@ def roll_for_order(players):
 
 
 def resolve_ties(roll_dict):
+    """
+    Takes a dict of name -> roll value and sorts them highest to lowest.
+    If two or more players rolled the same number, they re-roll between
+    themselves until the tie is broken. Recursive.
+
+    Args:
+        roll_dict: dict of player name -> roll value
+
+    Returns:
+        Ordered list of player names, highest roll first.
+    """
     by_roll = {}
     for name, val in roll_dict.items():
         if val not in by_roll:
@@ -81,7 +137,7 @@ def resolve_ties(roll_dict):
     return final_order
 
 
-# Start of the main game loop
+# ---- start of actual game ----
 
 print("\nWelcome to Cluedo!\n")
 

@@ -1,0 +1,241 @@
+Cluedo Code Reference
+
+This is a single big reference note for the Python code in the codebase folder.
+
+
+
+board_mask_script.py
+
+
+This file is a small utility for building or editing the collision board mask image by hand.
+this is only method I could come up with to create the grid system AND use the provided game board.
+
+clue!.py
+
+
+This is the main pygame game file. It handles the board view, player turns, movement, AI turns, private information, and most of the interface.
+
+Class: CluedoGame
+
+Main controller for the full graphical version of the project.
+
+- __init__(self)
+  Sets up pygame resources, loads board assets, builds the grid, prepares menu state, and initialises all the major game variables.
+
+- hide_private_view(self)
+  Hides hand/checklist information and clears the handoff state used between human turns.
+
+- reset_turn_state(self)
+  Resets per-turn movement values like phase, dice result, reachable cells, and remaining steps.
+
+- sync_menu_selection(self)
+  Keeps the setup menu values inside sensible limits so the cursor and player count do not drift out of range.
+
+- prepare_private_view(self)
+  Decides whether the next turn should begin with a privacy handoff screen or with private info hidden.
+
+- start_selected_game(self)
+  Starts a new match from the menu selections and resets the board/game state for active play.
+
+- return_to_menu(self)
+  Stops the current game session and returns the interface to the setup menu.
+
+- setup_card_game(self)
+  Creates the player objects, deals the cards, creates the envelope, and synchronises the board-side game state.
+
+- roll_for_order(self, players)
+  Rolls dice for a list of players to determine a turn order. Looks like utility logic that may be useful even if the board game currently starts with Miss Scarlett.
+
+- resolve_turn_ties(self, roll_dict)
+  Breaks ties in turn-order rolls by re-rolling tied players until a clear order exists.
+
+- current_player(self)
+  Returns the Player object whose turn it currently is.
+
+- human_viewer(self)
+  Returns a human player for UI fallback purposes, if one is available.
+
+- players_from_current_turn(self)
+  Returns the player list starting from the current turn position and wrapping around.
+
+- current_room_name(self, name=None)
+  Returns the room the named character is standing in, or None if they are in a hallway/start area.
+
+- can_accuse_now(self)
+  Checks whether the current player is allowed to accuse at this point in the turn.
+
+- schedule_ai_turn(self)
+  Schedules an AI action with a short delay so AI turns do not happen instantly.
+
+- should_log_message(self, message)
+  Filters out routine/noisy log messages so the side panel stays readable.
+
+- log_style(self, message)
+  Assigns a label and colour to a log message depending on the event type.
+
+- log_message(self, message)
+  Adds a message to the rolling event log after filtering and tagging it.
+
+- classify_cell(self, gx, gy)
+  Examines the board mask over a whole grid block and decides what kind of board cell it is.
+
+- create_grid(self)
+  Builds the full board grid from the saved mask image.
+
+- next_turn(self)
+  Moves play to the next active player and resets turn-related state.
+
+- build_door_room_map(self)
+  Creates a lookup showing which room or rooms each door tile leads into.
+
+- build_room_slot_map(self)
+  Chooses a set of usable room tiles for placing characters and weapon tokens inside rooms.
+
+- build_room_anchor_map(self)
+  Keeps one default tile per room as a fallback position.
+
+- get_available_room_slot(self, room_name, moving_name=None)
+  Finds a room tile that is free enough to place a character or token.
+
+- place_character_in_room(self, character_name, room_name)
+  Moves a named character token into a room using one of the room slots.
+
+- place_spare_characters(self)
+  Places unused characters into rooms before the game starts, matching the board-game rule that spare pieces stay in play.
+
+- setup_weapon_tokens(self)
+  Places each weapon into a room at the start of a game.
+
+- move_suggestion_tokens(self, suspect_name, weapon_name, room_name)
+  Moves the suggested suspect and weapon into the room named in a suggestion.
+
+- draw_weapons(self, y_off)
+  Draws weapon tokens on top of the board.
+
+- is_occupied_by_other(self, gx, gy)
+  Checks whether another active player is already standing on a given walkable tile.
+
+- current_door_rooms(self)
+  Returns the rooms a player could enter from their current door tile.
+
+- current_secret_passage_destination(self)
+  Returns the destination room if the current player is standing in a room with a secret passage.
+
+- shortest_walk_distance(self, start, goal, max_steps)
+  Finds the shortest walk distance between two positions, respecting occupied tiles and movement limits.
+
+- open_suggestion_dialog(self, room_name=None)
+  Opens the suggestion modal if the player is allowed to make a suggestion.
+
+- open_accusation_dialog(self)
+  Opens the accusation modal if the current turn rules allow it.
+
+- move_suspect_into_room(self, suspect_name, room_name)
+  Moves a suspect piece into a room after a suggestion is made.
+
+- submit_suggestion(self)
+  Resolves the suggestion currently selected in the modal and updates the board/log state.
+
+- submit_accusation(self)
+  Resolves the accusation selected in the modal and either ends the game or eliminates the player.
+
+- pick_ai_room(self, player, reachable_rooms)
+  Chooses which reachable room an AI player should prefer, leaning toward rooms it still has not ruled out.
+
+- run_ai_turn(self)
+  Runs a complete AI turn on the graphical board.
+
+- roll_dice(self)
+  Rolls two dice and switches the player into movement mode.
+
+- compute_reachable(self, start_gx, start_gy, steps)
+  Calculates hallway tiles and rooms reachable with the current move count.
+
+- skip_move(self)
+  Ends movement or the whole turn early.
+
+- use_secret_passage(self)
+  Moves the current player through a secret passage if they are in a valid room.
+
+- handle_move(self, target_gx, target_gy)
+  Validates and applies a human player move to a hallway tile or room.
+
+- draw_event_log_panel(self, log_rect, accent_color)
+  Draws the event log on the side panel.
+
+- draw_private_info_panel(self, current_player, left_x, y, panel_height, accent_color)
+  Draws hand/checklist information, or the hidden/handoff version of that panel.
+
+- draw_side_panel(self)
+  Draws the whole right-hand gameplay panel.
+
+- draw_modal(self)
+  Draws the current suggestion/accusation dialog if one is open.
+
+- draw_menu_overlay(self)
+  Draws the setup menu overlay.
+
+- draw_handoff_overlay(self)
+  Draws the screen used when the device is passed between human players.
+
+- draw_help_overlay(self)
+  Draws the how-to-play overlay.
+
+- draw_game_over_overlay(self)
+  Draws the end-of-game overlay with winner and solution information.
+
+- draw(self)
+  Draws the board and whichever UI overlays are active for the current game state.
+
+- draw_ui(self)
+  Draws the top strip with turn, controls, and phase information.
+
+- handle_input(self)
+  Processes keyboard and mouse input for menu mode, gameplay mode, overlays, and modals.
+
+- run(self)
+  Main pygame loop for the graphical game.
+
+cluedo_board_gui.py
+
+This file is a board viewer/debugger for checking the room mask against the board image.
+
+Class: CluedoBoardGUI
+
+Small helper window for visualising the board grid and room overlays.
+
+- __init__(self)
+  Loads the board and mask images, builds the grid, and prepares the viewer state.
+
+- create_grid(self)
+  Builds grid cell data by sampling the mask image.
+
+- draw_board(self)
+  Draws the base board image.
+
+- draw_grid_overlay(self)
+  Draws a visible grid over the board.
+
+- draw_room_overlay(self)
+  Draws semi-transparent room colours on top of the board.
+
+- draw_selected_cell(self)
+  Highlights the currently selected cell.
+
+- draw_ui(self)
+  Draws the status text and control hints.
+
+- get_cell_at_pixel(self, pixel_x, pixel_y)
+  Converts screen pixel coordinates into a grid cell.
+
+- handle_input(self, event)
+  Handles clicks and key presses for the viewer.
+
+- run(self)
+  Main loop for the board viewer.
+
+Function: main()
+
+Starts the board viewer and handles missing-image errors.
+
+
